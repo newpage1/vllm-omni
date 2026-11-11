@@ -30,7 +30,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     RequestScopedCacheDiTRuntime,
 )
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
-from vllm_omni.diffusion.cache.inter_request import HIT_EXACT, HIT_PARTIAL
+from vllm_omni.diffusion.cache.inter_request import HIT_EXACT, HIT_MISS, HIT_PARTIAL
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group, init_world_group
