@@ -106,6 +106,11 @@ class H3CacheKey:
                     "sampler": self.sampler,
                     "seed": int(self.seed),
                     "model_fingerprint": self.model_fingerprint,
+                    # Entries recorded under another cache config (e.g. a
+                    # swapped CLIP text encoder) must not even be *candidates*
+                    # for semantic reuse: their pooled embeddings come from a
+                    # different encoder and are not comparable.
+                    "cache_config_hash": self.cache_config_hash,
                 }
             )
             object.__setattr__(self, "shape_key", shape_key)

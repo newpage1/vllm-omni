@@ -14,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Mapping
 
 # ``--cache-config '{"inter_request": {...}}'`` and
@@ -39,6 +41,41 @@ def _lookup(config: Any, name: str, default: Any = None) -> Any:
         return getattr(config, name)
     except AttributeError:
         return default
+
+
+@lru_cache(maxsize=8)
+def _clip_identity(resolved: str) -> str:
+    """Best-effort identity of a CLIP checkpoint tree: ``path|bytes|mtime``.
+
+    The semantic path stores 768-d pooled embeddings, which are only comparable
+    when they came from the same text encoder.  Including the on-disk weight
+    identity in the config hash makes a swapped/replaced checkpoint invalidate
+    the whole cache (conservative) instead of silently matching embeddings from
+    a different model.  Identity is read once per process; if the path is not
+    readable the plain path is used so every rank still agrees.
+    """
+    total = 0
+    newest = 0
+    try:
+        root = Path(resolved)
+        if root.is_dir():
+            weights = sorted(root.glob("*.safetensors")) or sorted(root.glob("*.bin"))
+            for item in weights:
+                try:
+                    stat = item.stat()
+                except OSError:
+                    continue
+                total += int(stat.st_size)
+                newest = max(newest, int(stat.st_mtime_ns))
+        elif root.is_file():
+            stat = root.stat()
+            total = int(stat.st_size)
+            newest = int(stat.st_mtime_ns)
+    except OSError:
+        return resolved
+    if not total:
+        return resolved
+    return f"{resolved}|{total}|{newest}"
 
 
 @dataclass(frozen=True)
@@ -93,17 +130,39 @@ class InterRequestCacheConfig:
     def intra_backend_name(self) -> str | None:
         return None if self.intra_backend is None else str(self.intra_backend).lower()
 
+    @property
+    def clip_identity(self) -> str:
+        """Identity of the CLIP text encoder used by the semantic path.
+
+        Empty when the semantic path is disabled, so exact-only deployments do
+        not depend on a CLIP model being present.
+        """
+        if not self.semantic_enabled:
+            return ""
+        raw = str(self.clip_model_path)
+        try:
+            resolved = str(Path(raw).expanduser().resolve())
+        except OSError:
+            resolved = raw
+        return _clip_identity(resolved)
+
     def config_hash(self) -> str:
-        """Stable hash of the knobs that change reuse semantics."""
+        """Stable hash of the knobs that change reuse semantics.
+
+        ``clip`` carries the CLIP checkpoint identity: swapping the text
+        encoder changes every key, so entries recorded with another encoder
+        can never be reused (their pooled embeddings are not comparable).
+        """
         payload = {
             "mode": self.mode,
+            "clip": self.clip_identity,
             "clip_threshold": round(float(self.clip_threshold), 6),
             "min_skip_steps": int(self.min_skip_steps),
             "max_skip_ratio": round(float(self.max_skip_ratio), 6),
             "record_steps": bool(self.record_steps),
             "max_entries": int(self.max_entries),
             "intra_backend": self.intra_backend_name,
-            "schema": 1,
+            "schema": 2,
         }
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
