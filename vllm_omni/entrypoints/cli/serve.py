@@ -836,7 +836,7 @@ class OmniServeCommand(CLISubcommand):
             default="none",
             help=(
                 "Cache backend for diffusion models, options: 'tea_cache', "
-                "'cache_dit', 'mag_cache', 'sea_cache', 'step_cache'"
+                "'cache_dit', 'mag_cache', 'sea_cache', 'step_cache', 'inter_request'"
             ),
         )
         omni_config_group.add_argument(
@@ -846,7 +846,72 @@ class OmniServeCommand(CLISubcommand):
             help="JSON string of cache configuration. "
             "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
             'MagCache: \'{"mag_threshold": 0.24, "mag_max_skip_steps": 5, "mag_retention_ratio": 0.1}\'. '
-            "Calibration mode: add '\"mag_calibrate\": true'",
+            "Calibration mode: add '\"mag_calibrate\": true'. "
+            "Inter-request cache: "
+            '\'{"inter_request": {"mode": "exact_semantic", "persistent_dir": "/cache/dit", '
+            '"clip_model_path": "/models/clip-vit-large-patch14", "clip_threshold": 0.65, '
+            '"min_skip_steps": 5, "max_skip_ratio": 0.5, "intra_backend": "cache_dit"}}\'',
+        )
+        omni_config_group.add_argument(
+            "--inter-request-cache-dir",
+            type=str,
+            default=None,
+            dest="inter_request_persistent_cache_dir",
+            help="Directory of the persistent inter-request DiT cache (per-rank subdirectories).",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-clip-model-path",
+            type=str,
+            default=None,
+            help="Local CLIP text model used to score prompt similarity for step-K resume.",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-clip-threshold",
+            type=float,
+            default=None,
+            help="CLIP cosine threshold for a partial inter-request hit (default 0.65).",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-clip-min-skip",
+            type=int,
+            default=None,
+            help="Minimum number of DiT steps a partial hit must skip (default 5).",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-clip-max-skip-ratio",
+            type=float,
+            default=None,
+            help="Maximum fraction of DiT steps a partial hit may skip (default 0.5).",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-intra-backend",
+            type=str,
+            default=None,
+            help="Intra-request backend combined with inter-request reuse (currently 'cache_dit').",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-mode",
+            type=str,
+            default=None,
+            help="Inter-request cache mode: 'exact' or 'exact_semantic' (default).",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-max-entries",
+            type=int,
+            default=None,
+            help="Maximum cached entries per DiT rank (default 8).",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-max-memory-gb",
+            type=float,
+            default=None,
+            help="Soft memory budget of the in-memory inter-request cache per rank (default 2.0).",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-record-steps",
+            action="store_true",
+            default=None,
+            help="Record per-step packed video/audio rows so a similar prompt can resume at step K.",
         )
         omni_config_group.add_argument(
             "--video-output-transport",

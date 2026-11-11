@@ -833,6 +833,19 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     cache_config: Any = field(default_factory=dict)
     video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
+    # Inter-request (cross-request) DiT cache overrides.  ``None`` keeps the
+    # value coming from ``--cache-config`` (or the DiffusionCacheConfig default).
+    inter_request_mode: str | None = None
+    inter_request_max_entries: int | None = None
+    inter_request_max_memory_gb: float | None = None
+    inter_request_record_step_latents: bool | None = None
+    inter_request_persistent_cache_dir: str | None = None
+    inter_request_clip_model_path: str | None = None
+    inter_request_clip_device: str | None = None
+    inter_request_clip_threshold: float | None = None
+    inter_request_clip_min_skip: int | None = None
+    inter_request_clip_max_skip_ratio: float | None = None
+    inter_request_intra_backend: str | None = None
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
     enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
@@ -1015,6 +1028,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             self.cache_config = DiffusionCacheConfig()
 
+        self._apply_inter_request_overrides()
+
         if self.video_output_transport is None:
             self.video_output_transport = VideoOutputTransportConfig()
         elif isinstance(self.video_output_transport, Mapping):
@@ -1083,6 +1098,41 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
                 "diffusers_load_kwargs and diffusers_call_kwargs are only "
                 "valid together with diffusion_load_format=diffusers"
             )
+
+    def _apply_inter_request_overrides(self) -> None:
+        """Merge dedicated ``--inter-request-*`` flags into the cache config.
+
+        ``--cache-config`` remains the primary, structured way to configure the
+        inter-request cache; the flat CLI flags exist so the feature can be
+        driven without hand-writing JSON and so that experiments are easy to
+        script.  Explicit flags win over the JSON block.
+        """
+        overrides = {
+            "inter_request_mode": self.inter_request_mode,
+            "inter_request_max_entries": self.inter_request_max_entries,
+            "inter_request_max_memory_gb": self.inter_request_max_memory_gb,
+            "inter_request_record_step_latents": self.inter_request_record_step_latents,
+            "inter_request_persistent_cache_dir": self.inter_request_persistent_cache_dir,
+            "inter_request_clip_model_path": self.inter_request_clip_model_path,
+            "inter_request_clip_device": self.inter_request_clip_device,
+            "inter_request_clip_threshold": self.inter_request_clip_threshold,
+            "inter_request_clip_min_skip": self.inter_request_clip_min_skip,
+            "inter_request_clip_max_skip_ratio": self.inter_request_clip_max_skip_ratio,
+            "inter_request_intra_backend": self.inter_request_intra_backend,
+        }
+        applied = {
+            name: value
+            for name, value in overrides.items()
+            if value is not None and getattr(self.cache_config, name, None) != value
+        }
+        if not applied:
+            return
+        for name, value in applied.items():
+            setattr(self.cache_config, name, value)
+        logger.info(
+            "Applied inter-request cache overrides from CLI: %s",
+            ", ".join(f"{name}={value}" for name, value in sorted(applied.items())),
+        )
 
     def _propagate_quantization_from_tf_config(self, tf_config: Any) -> None:
         quant_config = getattr(tf_config, "quant_config", None)

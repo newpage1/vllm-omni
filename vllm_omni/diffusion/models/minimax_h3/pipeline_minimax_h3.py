@@ -30,6 +30,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     RequestScopedCacheDiTRuntime,
 )
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
+from vllm_omni.diffusion.cache.inter_request import HIT_EXACT, HIT_PARTIAL
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group, init_world_group
@@ -2113,6 +2114,258 @@ class MiniMaxH3Pipeline(
         refine: MiniMaxH3LatentRefineSpec | None = None,
         request_context: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Cross-request reuse is decided before the noise is materialised: an
+        # exact hit returns the cached pre-VAE latents without touching the DiT
+        # at all, a partial hit only replays steps [K, N).
+        inter_session = self._begin_inter_request(
+            request_context=request_context,
+            task=task,
+            seed=seed,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            audio_t=audio_t,
+            num_frames=num_frames,
+            num_steps=num_steps,
+            video_shift=video_shift,
+            audio_shift=audio_shift,
+            sampler=sampler,
+            init_latents=init_latents,
+            refine=refine,
+            visual_condition=visual_condition,
+            audio_condition=audio_condition,
+            ref_audio_t=ref_audio_t,
+            keyframe_frame_indices=keyframe_frame_indices,
+            guide_blocks=guide_blocks,
+            ref_blocks=ref_blocks,
+            locked_audio_rows=locked_audio_rows,
+            temporal_offset=temporal_offset,
+            video_edit_clean_rows=video_edit_clean_rows,
+            video_edit_mask_rows=video_edit_mask_rows,
+            video_edit_restore_mask_rows=video_edit_restore_mask_rows,
+            audio_edit_clean_rows=audio_edit_clean_rows,
+            audio_edit_mask_rows=audio_edit_mask_rows,
+            audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
+        )
+        start_step = 0
+        resume_video_rows = None
+        resume_audio_rows = None
+        kind = inter_session.decision.kind if inter_session is not None else HIT_MISS
+        if kind == HIT_EXACT:
+            # Replay zero denoise steps through the regular path so the DLO
+            # residency context, rope-table preparation and hook resets all stay
+            # balanced with the requests that actually run the DiT; the cached
+            # final rows are then unpacked to the pre-VAE latents.
+            checkpoint, _ = inter_session.decision.entry.checkpoint_at(int(num_steps))
+            if checkpoint is not None:
+                start_step = int(num_steps)
+                resume_video_rows = checkpoint.video_rows
+                resume_audio_rows = checkpoint.audio_rows
+                logger.info(
+                    "[inter-request] exact hit: DiT skipped, reusing cached final rows "
+                    "(start_step=%d/%d, %d steps skipped)",
+                    start_step,
+                    num_steps,
+                    num_steps,
+                )
+            else:
+                with self._resident_dit_layers_on_device():
+                    video_latent, audio_latent = inter_session.exact_latents(self.device)
+                logger.info(
+                    "[inter-request] exact hit: DiT skipped, returning cached latents "
+                    "video=%s audio=%s",
+                    tuple(video_latent.shape),
+                    tuple(audio_latent.shape),
+                )
+                return video_latent, audio_latent
+        elif kind == HIT_PARTIAL:
+            checkpoint = inter_session.decision.checkpoint
+            if checkpoint is None:
+                raise RuntimeError("[inter-request] partial hit without a step checkpoint")
+            start_step = int(inter_session.decision.start_step)
+            resume_video_rows = checkpoint.video_rows
+            resume_audio_rows = checkpoint.audio_rows
+        try:
+            return self._diffuse_from_step(
+                start_step=start_step,
+                resume_video_rows=resume_video_rows,
+                resume_audio_rows=resume_audio_rows,
+                inter_session=inter_session,
+                task=task,
+                text_embeddings=text_embeddings,
+                text_tags=text_tags,
+                seed=seed,
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+                num_frames=num_frames,
+                num_steps=num_steps,
+                video_shift=video_shift,
+                audio_shift=audio_shift,
+                base_schedule=base_schedule,
+                visual_condition=visual_condition,
+                visual_condition_shape=visual_condition_shape,
+                audio_condition=audio_condition,
+                ref_audio_t=ref_audio_t,
+                ref_blocks=ref_blocks,
+                visual_condition_shapes=visual_condition_shapes,
+                audio_condition_lengths=audio_condition_lengths,
+                keyframe_frame_indices=keyframe_frame_indices,
+                guide_blocks=guide_blocks,
+                pad_seq_len=pad_seq_len,
+                locked_audio_rows=locked_audio_rows,
+                temporal_offset=temporal_offset,
+                media_time_origin=media_time_origin,
+                video_edit_clean_rows=video_edit_clean_rows,
+                video_edit_mask_rows=video_edit_mask_rows,
+                video_edit_restore_mask_rows=video_edit_restore_mask_rows,
+                audio_edit_clean_rows=audio_edit_clean_rows,
+                audio_edit_mask_rows=audio_edit_mask_rows,
+                audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
+                sampler=sampler,
+                init_latents=init_latents,
+                refine=refine,
+                request_context=request_context,
+            )
+        except BaseException:
+            if inter_session is not None:
+                inter_session.abort()
+            raise
+
+    def _begin_inter_request(
+        self,
+        *,
+        request_context: dict[str, Any] | None,
+        task: str,
+        seed: int,
+        latent_t: int,
+        latent_h: int,
+        latent_w: int,
+        audio_t: int,
+        num_frames: int,
+        num_steps: int,
+        video_shift: float,
+        audio_shift: float,
+        sampler: str,
+        init_latents: tuple[torch.Tensor, torch.Tensor] | None,
+        refine: MiniMaxH3LatentRefineSpec | None,
+        visual_condition: torch.Tensor | None = None,
+        audio_condition: torch.Tensor | None = None,
+        ref_audio_t: int | None = None,
+        keyframe_frame_indices: list[int] | None = None,
+        guide_blocks: list[dict[str, Any]] | None = None,
+        ref_blocks: list[dict[str, Any]] | None = None,
+        locked_audio_rows: torch.Tensor | None = None,
+        temporal_offset: float = 0.0,
+        video_edit_clean_rows: torch.Tensor | None = None,
+        video_edit_mask_rows: torch.Tensor | None = None,
+        video_edit_restore_mask_rows: torch.Tensor | None = None,
+        audio_edit_clean_rows: torch.Tensor | None = None,
+        audio_edit_mask_rows: torch.Tensor | None = None,
+        audio_edit_restore_mask_rows: torch.Tensor | None = None,
+    ) -> Any:
+        """Open an inter-request cache session, or return None when ineligible.
+
+        Only a plain text-to-video+audio request is cacheable in this MVP: any
+        image/audio conditioning, guide block, edit mask or continuation makes
+        the first denoise steps depend on inputs the cache key does not carry,
+        so such requests bypass the cache instead of risking a false hit.
+        """
+        backend = getattr(self, "_inter_request_cache_backend", None)
+        if backend is None or not backend.is_enabled():
+            return None
+        if request_context is None or init_latents is not None or refine is not None:
+            return None
+        # A continuation request starts from the previous clip's rows, so its
+        # first steps are not reproducible from the request key alone.
+        if request_context.get("continuation") is not None:
+            return None
+        prompt = request_context.get("_inter_request_prompt")
+        if not prompt:
+            return None
+        if str(task) != "t2va":
+            return None
+        if (
+            visual_condition is not None
+            or audio_condition is not None
+            or ref_audio_t is not None
+            or keyframe_frame_indices
+            or guide_blocks
+            or ref_blocks
+            or locked_audio_rows is not None
+            or float(temporal_offset) != 0.0
+            or video_edit_clean_rows is not None
+            or video_edit_mask_rows is not None
+            or video_edit_restore_mask_rows is not None
+            or audio_edit_clean_rows is not None
+            or audio_edit_mask_rows is not None
+            or audio_edit_restore_mask_rows is not None
+        ):
+            logger.debug("[inter-request] request carries conditioning inputs; cross-request cache bypassed")
+            return None
+        fps = int(request_context.get("_inter_request_fps") or MINIMAX_H3_FPS)
+        return backend.begin_request(
+            self,
+            prompt=prompt,
+            task=task,
+            seed=seed,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            audio_t=audio_t,
+            num_frames=num_frames,
+            num_steps=num_steps,
+            video_shift=video_shift,
+            audio_shift=audio_shift,
+            sampler=sampler,
+            fps=fps,
+        )
+
+    def _diffuse_from_step(
+        self,
+        *,
+        start_step: int,
+        resume_video_rows: torch.Tensor | None,
+        resume_audio_rows: torch.Tensor | None,
+        inter_session: Any,
+        task: str,
+        text_embeddings: torch.Tensor,
+        text_tags: torch.Tensor,
+        seed: int,
+        latent_t: int,
+        latent_h: int,
+        latent_w: int,
+        audio_t: int,
+        num_frames: int,
+        num_steps: int,
+        video_shift: float,
+        audio_shift: float,
+        base_schedule: Sequence[float] | None,
+        visual_condition: torch.Tensor | None,
+        visual_condition_shape: tuple[int, int, int] | None,
+        audio_condition: torch.Tensor | None,
+        ref_audio_t: int | None,
+        ref_blocks: list[dict[str, Any]] | None,
+        visual_condition_shapes: list[tuple[int, int, int]] | None,
+        audio_condition_lengths: list[int] | None,
+        keyframe_frame_indices: list[int] | None,
+        guide_blocks: list[dict[str, Any]] | None,
+        pad_seq_len: int | None,
+        locked_audio_rows: torch.Tensor | None,
+        temporal_offset: float,
+        media_time_origin: int | None,
+        video_edit_clean_rows: torch.Tensor | None,
+        video_edit_mask_rows: torch.Tensor | None,
+        video_edit_restore_mask_rows: torch.Tensor | None,
+        audio_edit_clean_rows: torch.Tensor | None,
+        audio_edit_mask_rows: torch.Tensor | None,
+        audio_edit_restore_mask_rows: torch.Tensor | None,
+        sampler: str,
+        init_latents: tuple[torch.Tensor, torch.Tensor] | None,
+        refine: MiniMaxH3LatentRefineSpec | None,
+        request_context: dict[str, Any] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Consume request-owned noise here so caller keyword dictionaries cannot
         # keep the host buffers alive throughout denoising.
         inputs = self._build_denoise_inputs(
@@ -2165,11 +2418,27 @@ class MiniMaxH3Pipeline(
         registry = getattr(transformer, "_hook_registry", None)
         if registry is not None:
             registry.reset_hook(TeaCacheHook._HOOK_NAME)
+        total_steps = len(inputs["sigmas_video"]) - 1
+        remaining_steps = total_steps - start_step
+        if start_step:
+            logger.info(
+                "[inter-request] resuming denoise loop at step %d/%d (%d steps replayed, %d skipped)",
+                start_step,
+                total_steps,
+                remaining_steps,
+                start_step,
+            )
+
+        def _on_step(step: int, video: torch.Tensor, audio: torch.Tensor) -> None:
+            progress.update()
+            if inter_session is not None:
+                inter_session.record_after_step(step, video, audio)
+        # Composite mode: Cache-DiT only sees the steps this request will run.
         cache_runtime = getattr(self, "_cache_dit_runtime", None)
-        if cache_runtime is not None:
-            cache_runtime.refresh(len(inputs["sigmas_video"]) - 1)
+        if cache_runtime is not None and remaining_steps > 0:
+            cache_runtime.refresh(remaining_steps)
         with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
-            with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
+            with self.progress_bar(total=remaining_steps) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     sampler=inputs["sampler"],
                     model=transformer,
@@ -2185,10 +2454,23 @@ class MiniMaxH3Pipeline(
                     audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
                     video_edit=inputs["video_edit"],
                     audio_edit=inputs["audio_edit"],
-                    on_step=lambda step, video, audio: progress.update(),
+                    on_step=_on_step,
+                    start_step=start_step,
+                    resume_video_rows=resume_video_rows,
+                    resume_audio_rows=resume_audio_rows,
                 )
 
-        return self._unpack_denoised_rows(
+        if cache_runtime is not None and remaining_steps > 0 and getattr(cache_runtime, "is_enabled", False):
+            # Emit the Cache-DiT block statistics while the intra-request cache
+            # is still installed; the runner-level summary runs after the
+            # request-scoped runtime has already been torn down.
+            try:
+                from vllm_omni.diffusion.cache.cachedit.backend import cache_summary
+
+                cache_summary(self, details=False)
+            except Exception:  # noqa: BLE001 - statistics must never fail a request
+                logger.debug("[inter-request] cache-dit summary failed", exc_info=True)
+        video_latent, audio_latent = self._unpack_denoised_rows(
             branch,
             video_rows,
             audio_rows,
@@ -2197,6 +2479,9 @@ class MiniMaxH3Pipeline(
             latent_w=latent_w,
             audio_t=audio_t,
         )
+        if inter_session is not None and remaining_steps > 0:
+            inter_session.commit(video_latent, audio_latent)
+        return video_latent, audio_latent
 
     def decode_to_mp4(
         self,
@@ -2863,6 +3148,10 @@ class MiniMaxH3Pipeline(
         else:
             conditioning = self._extract_encoder_conditioning(raw_prompt)
         context.update(self._prepare_encoder_conditioning_inputs(conditioning, sampling))
+        # The cross-request cache needs the prompt text and the frame rate; the
+        # denoise inputs themselves only carry tensors and shapes.
+        context.setdefault("_inter_request_prompt", self._extract_prompt(raw_prompt)[0])
+        context.setdefault("_inter_request_fps", MINIMAX_H3_FPS)
         if (
             context.get("latent_refine") is not None
             and context.get("latent_upscale") is not None
@@ -3154,7 +3443,7 @@ class MiniMaxH3Pipeline(
         if cache_dit is not None:
             raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
         cache_backend = str(getattr(self.od_config, "cache_backend", None) or "none").lower()
-        if cache_backend not in ("none", "cache_dit"):
+        if cache_backend not in ("none", "cache_dit", "inter_request", "inter-request"):
             raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
         if self._fasth3 is not None or self._fasth3_checkpoint is not None:
             raise OmniClientError("MiniMax H3 timeline guides require base H3 weights, not FastH3")

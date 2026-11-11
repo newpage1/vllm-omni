@@ -915,8 +915,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 logger.debug("prompt-embed cache: %s", prompt_embed_cache.stats())
 
             runner_cache_dit_enabled = self.cache_backend is not None and self.cache_backend.is_enabled()
+            # Composite mode (inter-request + cache-dit) keeps the runner
+            # backend enabled, but the pipeline owns the Cache-DiT runtime.
+            cache_dit_configured = od_config.cache_backend == "cache_dit" or (
+                od_config.cache_backend in ("inter_request", "inter-request")
+                and str(getattr(self.pipeline, "_inter_request_intra_backend", "") or "").lower() == "cache_dit"
+            )
             if (
-                od_config.cache_backend == "cache_dit"
+                cache_dit_configured
                 and od_config.enable_cache_dit_summary
                 and (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline))
             ):

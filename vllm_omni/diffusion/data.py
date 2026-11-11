@@ -665,6 +665,23 @@ class DiffusionCacheConfig:
     step_cache_dit_min_history: int = 2
     step_cache_dit_max_history: int = 2
 
+    # Inter-request (cross-request) DiT cache.  These fields are mirrors of the
+    # nested ``inter_request`` block accepted by ``--cache-config``; they exist
+    # so the cache can be driven by dedicated CLI flags as well.
+    inter_request_mode: str = "exact_semantic"
+    inter_request_max_entries: int = 8
+    inter_request_max_memory_gb: float = 2.0
+    inter_request_record_step_latents: bool = True
+    inter_request_step_latents_dir: str | None = None
+    inter_request_persistent_cache_dir: str | None = None
+    inter_request_clip_model_path: str | None = None
+    inter_request_clip_device: str = "cpu"
+    inter_request_clip_threshold: float = 0.65
+    inter_request_clip_min_skip: int = 5
+    inter_request_clip_max_skip_ratio: float = 0.5
+    inter_request_intra_backend: str | None = None
+    inter_request_resume_warmup_steps: int = 4
+
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -864,6 +881,20 @@ class OmniDiffusionConfig:
     # Cache backend configuration (NEW)
     cache_backend: str | None = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
+    # Inter-request (cross-request) DiT cache overrides, mirrored from the
+    # dedicated ``--inter-request-*`` CLI flags.  ``None`` keeps the value that
+    # ``--cache-config`` (or the DiffusionCacheConfig default) provides.
+    inter_request_mode: str | None = None
+    inter_request_max_entries: int | None = None
+    inter_request_max_memory_gb: float | None = None
+    inter_request_record_step_latents: bool | None = None
+    inter_request_persistent_cache_dir: str | None = None
+    inter_request_clip_model_path: str | None = None
+    inter_request_clip_device: str | None = None
+    inter_request_clip_threshold: float | None = None
+    inter_request_clip_min_skip: int | None = None
+    inter_request_clip_max_skip_ratio: float | None = None
+    inter_request_intra_backend: str | None = None
     video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
 
@@ -1415,6 +1446,7 @@ class OmniDiffusionConfig:
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
+        self._apply_inter_request_overrides()
 
         if self.video_output_transport is None:
             self.video_output_transport = VideoOutputTransportConfig()
@@ -1483,6 +1515,40 @@ class OmniDiffusionConfig:
                     model_id,
                     self.model,
                 )
+
+    def _apply_inter_request_overrides(self) -> None:
+        """Merge dedicated ``--inter-request-*`` flags into ``cache_config``.
+
+        ``--cache-config`` stays the structured configuration path; the flat
+        flags exist so experiments can be scripted without hand-written JSON.
+        Explicit flags win over the JSON block.
+        """
+        overrides = {
+            "inter_request_mode": self.inter_request_mode,
+            "inter_request_max_entries": self.inter_request_max_entries,
+            "inter_request_max_memory_gb": self.inter_request_max_memory_gb,
+            "inter_request_record_step_latents": self.inter_request_record_step_latents,
+            "inter_request_persistent_cache_dir": self.inter_request_persistent_cache_dir,
+            "inter_request_clip_model_path": self.inter_request_clip_model_path,
+            "inter_request_clip_device": self.inter_request_clip_device,
+            "inter_request_clip_threshold": self.inter_request_clip_threshold,
+            "inter_request_clip_min_skip": self.inter_request_clip_min_skip,
+            "inter_request_clip_max_skip_ratio": self.inter_request_clip_max_skip_ratio,
+            "inter_request_intra_backend": self.inter_request_intra_backend,
+        }
+        applied = {
+            name: value
+            for name, value in overrides.items()
+            if value is not None and getattr(self.cache_config, name, None) != value
+        }
+        if not applied:
+            return
+        for name, value in applied.items():
+            setattr(self.cache_config, name, value)
+        logger.info(
+            "Applied inter-request cache overrides from CLI: %s",
+            ", ".join(f"{name}={value}" for name, value in sorted(applied.items())),
+        )
 
     @property
     def is_single_file(self) -> bool:

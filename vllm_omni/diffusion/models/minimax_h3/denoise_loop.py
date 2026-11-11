@@ -334,6 +334,9 @@ def minimax_h3_denoise_loop(
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
+    start_step: int = 0,
+    resume_video_rows: torch.Tensor | None = None,
+    resume_audio_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -341,6 +344,16 @@ def minimax_h3_denoise_loop(
     conditional task, pass ``keyframe_cond_rows`` and/or ``audio_ref_rows`` to
     pin those rows across every step. The model's raw positive velocity is the
     update signal; MiniMax H3 only supports cfg-distilled checkpoints.
+
+    ``start_step`` / ``resume_video_rows`` / ``resume_audio_rows`` resume a
+    preempted or cached run from step ``start_step``: the packed rows saved
+    after step ``start_step - 1`` replace the freshly prepared rows and both
+    solvers advance their step cursor. ``start_step == num_steps`` is allowed
+    for a fully cached request: every step is skipped and the restored rows are
+    returned unchanged, which keeps the residency/offload lifecycle identical
+    to a real run. Only the stateless Euler solver is supported, because the
+    multi-step solvers carry internal history that a cross-request checkpoint
+    does not preserve.
     """
     if len(sigmas_video) != len(sigmas_audio):
         raise ValueError("video/audio sigma schedules must have equal length")
@@ -369,7 +382,35 @@ def minimax_h3_denoise_loop(
     video_solver = create_h3_sample_solver(sampler, sigmas_video)
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
-    for step in range(num_steps):
+    start_step = int(start_step)
+    if start_step < 0 or start_step > num_steps:
+        raise ValueError(f"start_step must be in [0, {num_steps}], got {start_step}")
+    if start_step > 0:
+        if resume_video_rows is None or resume_audio_rows is None:
+            raise ValueError("start_step > 0 requires resume_video_rows and resume_audio_rows")
+        if sampler != "euler":
+            raise ValueError(
+                f"resuming from step {start_step} requires the stateless 'euler' sampler, got {sampler!r}"
+            )
+        if tuple(resume_video_rows.shape) != tuple(video_rows.shape):
+            raise ValueError(
+                "resume_video_rows shape mismatch: "
+                f"{tuple(resume_video_rows.shape)} vs {tuple(video_rows.shape)}"
+            )
+        if tuple(resume_audio_rows.shape) != tuple(audio_rows.shape):
+            raise ValueError(
+                "resume_audio_rows shape mismatch: "
+                f"{tuple(resume_audio_rows.shape)} vs {tuple(audio_rows.shape)}"
+            )
+        video_rows = resume_video_rows.to(device=device, dtype=video_rows.dtype).clone()
+        audio_rows = resume_audio_rows.to(device=device, dtype=audio_rows.dtype).clone()
+        if keyframe_cond_rows is not None:
+            video_rows[~update] = cond_anchor[~update]
+        if audio_ref_rows is not None:
+            audio_rows[~audio_update] = audio_anchor[~audio_update]
+        video_solver.step_index = start_step
+        audio_solver.step_index = start_step
+    for step in range(start_step, num_steps):
         check_request_cancellation()
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:

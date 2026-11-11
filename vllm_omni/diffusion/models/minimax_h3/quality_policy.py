@@ -99,6 +99,41 @@ def _with_force_refresh(
     )
 
 
+def _inter_request_block(od_config: Any) -> Mapping[str, Any] | None:
+    """Return the ``inter_request`` cache block from the cache config, if any."""
+    cache_config = getattr(od_config, "cache_config", None)
+    if cache_config is None:
+        return None
+    extra = getattr(cache_config, "_extra_params", None) or {}
+    for name in ("inter_request", "inter_request_cache"):
+        block = extra.get(name)
+        if isinstance(block, Mapping):
+            return block
+    return None
+
+
+def _inter_request_intra_backend(od_config: Any) -> str | None:
+    """Effective intra-request backend requested by the inter-request cache."""
+    block = _inter_request_block(od_config)
+    if block is not None and block.get("intra_backend"):
+        return str(block["intra_backend"]).lower()
+    cache_config = getattr(od_config, "cache_config", None)
+    value = getattr(cache_config, "inter_request_intra_backend", None) if cache_config is not None else None
+    return str(value).lower() if value else None
+
+
+def _inter_request_intra_config(od_config: Any) -> DiffusionCacheConfig | None:
+    block = _inter_request_block(od_config)
+    intra_config = None if block is None else block.get("intra_config")
+    if not intra_config:
+        return None
+    if isinstance(intra_config, DiffusionCacheConfig):
+        return intra_config
+    if isinstance(intra_config, Mapping):
+        return DiffusionCacheConfig.from_dict(dict(intra_config))
+    raise OmniClientError("inter_request.intra_config must be a mapping")
+
+
 def _cache_installation_key(base_key: str, force_refresh: tuple[int, str] | None) -> str:
     """Make refresh-policy transitions explicit to the request runtime.
 
@@ -126,7 +161,9 @@ class MiniMaxH3QualityPolicy:
     """Resolve H3 request quality into a declarative Cache-DiT target.
 
     When the server starts with Cache-DiT, omitted quality selects the
-    server-configured profile. Otherwise, omitted quality selects no cache.
+    server-configured profile; the same holds when the cross-request backend is
+    combined with Cache-DiT (composite mode). Otherwise, omitted quality selects
+    no cache.
     In either case, ``lossless`` selects no cache and ``high`` selects H3's
     high-quality profile. The policy therefore owns whether a request installs
     Cache-DiT; the startup backend only controls the omitted-quality default.
@@ -138,6 +175,11 @@ class MiniMaxH3QualityPolicy:
     def __init__(self, od_config: Any) -> None:
         self._od_config = od_config
         self._configured_backend = str(getattr(od_config, "cache_backend", "none") or "none").lower()
+        # The cross-request backend may wrap an intra-request backend.  In that
+        # case the intra backend, not ``cache_backend``, decides whether an
+        # omitted quality installs Cache-DiT.
+        self._composite = self._configured_backend in ("inter_request", "inter-request")
+        self._intra_backend = _inter_request_intra_backend(od_config) if self._composite else None
 
     def resolve(
         self,
@@ -149,9 +191,13 @@ class MiniMaxH3QualityPolicy:
         if quality == "high":
             base_key = MINIMAX_H3_HIGH_CACHE_KEY
             base_config = _high_quality_cache_config()
-        elif self._configured_backend == "cache_dit" and quality is None:
+        elif (
+            (self._configured_backend == "cache_dit" or self._intra_backend == "cache_dit") and quality is None
+        ):
             base_key = MINIMAX_H3_GENERIC_CACHE_KEY
-            base_config = self._od_config.cache_config
+            if self._composite:
+                base_key = f"{MINIMAX_H3_GENERIC_CACHE_KEY}:inter_request"
+            base_config = _inter_request_intra_config(self._od_config) or self._od_config.cache_config
         else:
             if _has_force_refresh_args(extra_args):
                 raise OmniClientError("MiniMax H3 force-refresh arguments require an active Cache-DiT request target")
