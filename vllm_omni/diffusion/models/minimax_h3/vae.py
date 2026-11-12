@@ -36,6 +36,10 @@ from vllm_omni.platforms import current_omni_platform
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .rank_local_decode import (
+    install_rank_local_tiled_decode,
+    uninstall_rank_local_tiled_decode,
+)
 from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -988,6 +992,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if getattr(self, "encode_only", False):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
+        # Opt-in prototype: the tiled decoder keeps each rank's tiles local and
+        # quantises them before they reach a collective, instead of gathering
+        # float32 tiles to every rank and materialising a full float32 video.
+        # No-op unless VLLM_OMNI_VAE_RANK_LOCAL_DECODE is set.
+        install_rank_local_tiled_decode(self)
         with self._decode_tiling_context(latent):
             decoded = self.model.decode_base(self._denormalize_latent(latent))
         if decoded.dtype == torch.uint8:
@@ -1036,6 +1045,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise TypeError("on_chunk must be callable")
         if not callable(getattr(self.model, "_adaptive_decode", None)):
             raise RuntimeError("Loaded MiniMax-H3 VAE does not expose temporal decode primitives")
+        # The streaming MP4 session reverts and packs float frames itself, so
+        # the uint8 rank-local assembly must not leak into this path.
+        uninstall_rank_local_tiled_decode(self)
         group = None
         if self.is_distributed_enabled():
             group = self._native_parallel_state().get("sp_process_group")
