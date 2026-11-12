@@ -2521,17 +2521,18 @@ class MiniMaxH3Pipeline(
                 dtype=torch.float16,
                 enabled=True,
             ):
-                videos = decode_chunks_to_mp4(
-                    self.video_vae,
-                    video_latent,
-                    fps=MINIMAX_H3_FPS,
-                    audio_waveforms=[audio_np],
-                    audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
-                    batch_frames=batch_frames,
-                    max_pending=max_pending,
-                    video_codec_options=video_codec_options,
-                    crop=(height, width),
-                )
+                with torch.inference_mode():
+                    videos = decode_chunks_to_mp4(
+                        self.video_vae,
+                        video_latent,
+                        fps=MINIMAX_H3_FPS,
+                        audio_waveforms=[audio_np],
+                        audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
+                        batch_frames=batch_frames,
+                        max_pending=max_pending,
+                        video_codec_options=video_codec_options,
+                        crop=(height, width),
+                    )
         if not videos:
             return b""
         if len(videos) != 1:
