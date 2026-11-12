@@ -2519,7 +2519,10 @@ class MiniMaxH3Pipeline(
         if audio_np.ndim == 3 and audio_np.shape[0] == 1:
             audio_np = audio_np[0]
 
-        with self._component_on_device(self.video_vae):
+        # Only the ViT decoder half produces pixels; keeping the CNN encoder
+        # off the device keeps the chunked decode peak below the full-decode
+        # one (decode() does the same via decoder_component).
+        with self._component_on_device(self.video_vae.decoder_component):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=torch.float16,
