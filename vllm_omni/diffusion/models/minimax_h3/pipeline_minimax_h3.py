@@ -2509,6 +2509,10 @@ class MiniMaxH3Pipeline(
         """
         from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4 as decode_chunks_to_mp4
 
+        # Same stage boundary as decode(): the denoise loop just ended, so its
+        # released activation pages must not stay mapped through the chunked
+        # decode peak.
+        self._release_stage_cache()
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
         audio_np = audio.detach().float().cpu().numpy()
