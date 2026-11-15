@@ -21,7 +21,9 @@ the first read):
     empty value selects every block.
 ``H3_MEM_JSONL_DIR``
     Output directory (default ``/tmp/h3_mem_phases``). One
-    ``h3_mem_phases_rank<N>.jsonl`` file per selected rank.
+    ``h3_mem_phases_rank<N>.jsonl`` file per selected rank. The historical
+    name ``H3_MEM_DIR`` is still accepted as a deprecated alias (it is used
+    only when ``H3_MEM_JSONL_DIR`` is unset).
 ``H3_MEM_RING``
     Number of most recent records kept in memory for error dumps
     (default ``256``).
@@ -29,12 +31,24 @@ the first read):
 Record fields follow the t79 design::
 
     rank, step, block, stage, edge, allocated_bytes, reserved_bytes,
-    peak_allocated_bytes, peak_reserved_bytes, shape, dtype, storage_ptr,
-    storage_bytes, peak_scope, ts, pid
+    peak_allocated_bytes, peak_reserved_bytes, peak_scope,
+    request_base_allocated_bytes, peak_delta_bytes, peak_delta_scope,
+    parent, shape, dtype, storage_ptr, storage_bytes, ts, pid
 
-``peak_scope`` is ``request_cumulative``: PyTorch/NPU peak counters are reset
-once per request, so a phase record reports the cumulative peak and a
-``peak_delta_bytes`` field that only grows when the phase sets a new high.
+Peak semantics (t86/F2). ``peak_allocated_bytes`` / ``peak_reserved_bytes`` are
+the raw allocator peaks from ``torch.npu.max_memory_allocated()`` /
+``max_memory_reserved()``. Those counters are *process lifetime* values: the
+probe deliberately does not call ``torch.npu.reset_peak_memory_stats()`` (it
+would perturb every other consumer of the allocator and add a per-request
+reset), so ``peak_scope`` is ``process_lifetime``. The request-relative view is
+``peak_delta_bytes = max(0, peak_allocated_bytes - request_base_allocated_bytes)``
+with ``peak_delta_scope = "since_request_start"``; the baseline is the
+``allocated_bytes`` captured by :func:`reset_peaks` at request start.
+
+``parent`` names the enclosing phase when phases nest (``attn.local_kernel``
+and the other ``attn.*`` records live inside ``block.attn``; ``ffn.*`` lives
+inside ``block.mlp``). Nested stages must never be summed: the child's bytes
+are already part of the parent's window.
 """
 
 from __future__ import annotations
@@ -56,6 +70,9 @@ ENV_PHASES = "H3_MEM_PHASES"
 ENV_RANKS = "H3_MEM_RANKS"
 ENV_BLOCKS = "H3_MEM_BLOCKS"
 ENV_DIR = "H3_MEM_JSONL_DIR"
+# Historical name used by the t79/t81 notes before the field was renamed to
+# match the constant; kept as a deprecated alias so old launch scripts work.
+ENV_DIR_LEGACY = "H3_MEM_DIR"
 ENV_RING = "H3_MEM_RING"
 
 DEFAULT_DIR = "/tmp/h3_mem_phases"
@@ -78,6 +95,30 @@ _BLOCK = -1
 _RANK: int | None = None
 _PEAK_ALLOCATED = 0
 _PEAK_RESERVED = 0
+# Allocated bytes captured when the request started; the request-relative peak
+# delta is measured against this baseline (the raw allocator peaks themselves
+# are process-lifetime values, see the module docstring).
+_REQUEST_BASE_ALLOCATED = 0
+_REQUEST_BASE_RESERVED = 0
+_LEGACY_DIR_WARNED = False
+
+# Enclosing phase for nested instrumentation points. A child's window is fully
+# contained in its parent's, so per-stage bytes must never be summed.
+STAGE_PARENTS: dict[str, str] = {
+    "attn.pre_attention": "block.attn",
+    "attn.ring_kernel": "block.attn",
+    "attn.local_kernel": "block.attn",
+    "attn.post_attention": "block.attn",
+    "ffn.fc1": "block.mlp",
+    "ffn.act": "block.mlp",
+    "ffn.fc2": "block.mlp",
+    "ffn.chunked": "block.mlp",
+}
+
+
+def stage_parent(stage: str) -> str | None:
+    """Return the enclosing phase name for a nested stage (or ``None``)."""
+    return STAGE_PARENTS.get(stage)
 
 # The NPU runtime is absent (or unusable) on CPU-only hosts; probing must never
 # fail a request there, so a failing allocator/synchronise call disables the
@@ -127,6 +168,7 @@ def _parse_int_set(value: str, *, env: str, wildcard: bool) -> frozenset[int] | 
 
 def _ensure_initialised() -> None:
     global _INITIALISED, _ENABLED, _RANKS, _BLOCKS, _OUTPUT_DIR, _RING_SIZE
+    global _LEGACY_DIR_WARNED
     if _INITIALISED:
         return
     with _STATE_LOCK:
@@ -137,7 +179,20 @@ def _ensure_initialised() -> None:
         _RANKS = ranks if ranks is not None else frozenset()
         blocks = _parse_int_set(os.environ.get(ENV_BLOCKS, DEFAULT_BLOCKS), env=ENV_BLOCKS, wildcard=True)
         _BLOCKS = blocks
-        _OUTPUT_DIR = os.environ.get(ENV_DIR, DEFAULT_DIR) or DEFAULT_DIR
+        configured_dir = os.environ.get(ENV_DIR)
+        if not configured_dir:
+            legacy_dir = os.environ.get(ENV_DIR_LEGACY)
+            if legacy_dir:
+                if not _LEGACY_DIR_WARNED:
+                    logger.warning(
+                        "[H3_MEM_PHASES] %s is deprecated; use %s instead (value %r)",
+                        ENV_DIR_LEGACY,
+                        ENV_DIR,
+                        legacy_dir,
+                    )
+                    _LEGACY_DIR_WARNED = True
+                configured_dir = legacy_dir
+        _OUTPUT_DIR = configured_dir or DEFAULT_DIR
         try:
             ring = int(os.environ.get(ENV_RING, str(DEFAULT_RING)))
         except ValueError as exc:
@@ -150,6 +205,7 @@ def reset_state_for_tests() -> None:
     """Test helper: forget cached environment state and in-memory records."""
     global _INITIALISED, _ENABLED, _RANKS, _BLOCKS, _OUTPUT_DIR, _RING_SIZE
     global _STEP, _BLOCK, _RANK, _PEAK_ALLOCATED, _PEAK_RESERVED
+    global _REQUEST_BASE_ALLOCATED, _REQUEST_BASE_RESERVED, _LEGACY_DIR_WARNED
     global _begin_count, _end_count, _last_begin, _last_end, _file_handle, _file_rank, _dumped_on_error
     global _NPU_MEMORY_OK, _NPU_SYNC_OK
     with _STATE_LOCK:
@@ -166,6 +222,9 @@ def reset_state_for_tests() -> None:
         _RANK = None
         _PEAK_ALLOCATED = 0
         _PEAK_RESERVED = 0
+        _REQUEST_BASE_ALLOCATED = 0
+        _REQUEST_BASE_RESERVED = 0
+        _LEGACY_DIR_WARNED = False
         _ring.clear()
         _begin_count = 0
         _end_count = 0
@@ -232,12 +291,28 @@ def current_step() -> int:
 
 
 def reset_peaks() -> None:
-    """Reset the cumulative peak tracker; call once per request."""
-    global _PEAK_ALLOCATED, _PEAK_RESERVED
+    """Capture the request baseline and reset the per-request shadow peaks.
+
+    The allocator peaks are process-lifetime counters and are *not* reset here
+    (see the module docstring); this only records the ``allocated_bytes`` /
+    ``reserved_bytes`` baseline used for ``peak_delta_bytes``.
+    """
+    global _PEAK_ALLOCATED, _PEAK_RESERVED, _REQUEST_BASE_ALLOCATED, _REQUEST_BASE_RESERVED
     if not probe_enabled():
         return
+    snapshot = memory_snapshot()
+    _REQUEST_BASE_ALLOCATED = snapshot["allocated_bytes"]
+    _REQUEST_BASE_RESERVED = snapshot["reserved_bytes"]
     _PEAK_ALLOCATED = 0
     _PEAK_RESERVED = 0
+
+
+def request_baseline() -> dict[str, int]:
+    """Request-start allocated/reserved baseline captured by reset_peaks()."""
+    return {
+        "request_base_allocated_bytes": _REQUEST_BASE_ALLOCATED,
+        "request_base_reserved_bytes": _REQUEST_BASE_RESERVED,
+    }
 
 
 def _npu_module():
@@ -329,12 +404,11 @@ def _emit(record: dict[str, Any], *, to_disk: bool) -> None:
 def _record(stage: str, edge: str, *, tensor: torch.Tensor | None, block: int | None, extra: dict | None) -> dict:
     snapshot = memory_snapshot()
     global _PEAK_ALLOCATED, _PEAK_RESERVED
-    peak_delta = 0
     if snapshot["peak_allocated_bytes"] > _PEAK_ALLOCATED:
-        peak_delta = snapshot["peak_allocated_bytes"] - _PEAK_ALLOCATED
         _PEAK_ALLOCATED = snapshot["peak_allocated_bytes"]
     if snapshot["peak_reserved_bytes"] > _PEAK_RESERVED:
         _PEAK_RESERVED = snapshot["peak_reserved_bytes"]
+    peak_delta = max(0, snapshot["peak_allocated_bytes"] - _REQUEST_BASE_ALLOCATED)
     record: dict[str, Any] = {
         "rank": _global_rank(),
         "step": _STEP,
@@ -342,8 +416,14 @@ def _record(stage: str, edge: str, *, tensor: torch.Tensor | None, block: int | 
         "stage": stage,
         "edge": edge,
         **snapshot,
-        "peak_scope": "request_cumulative",
+        # The raw allocator peaks are process-lifetime counters; the request
+        # view is peak_delta_bytes (see the module docstring).
+        "peak_scope": "process_lifetime",
+        "request_base_allocated_bytes": _REQUEST_BASE_ALLOCATED,
+        "request_base_reserved_bytes": _REQUEST_BASE_RESERVED,
         "peak_delta_bytes": peak_delta,
+        "peak_delta_scope": "since_request_start",
+        "parent": stage_parent(stage),
         **_tensor_fields(tensor),
         "ts": time.time(),
         "pid": os.getpid(),
@@ -453,3 +533,8 @@ def counters() -> dict[str, int]:
         "ring": len(_ring),
         "last_begin_stage_len": 0 if _last_begin is None else len(_last_begin.get("stage", "")),
     }
+
+
+def recent_records() -> list[dict[str, Any]]:
+    """Diagnostics for tests: a copy of the in-memory record ring."""
+    return [dict(record) for record in _ring]

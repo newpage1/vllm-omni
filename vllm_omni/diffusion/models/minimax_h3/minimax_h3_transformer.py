@@ -179,6 +179,24 @@ def _make_input_release(holder: list) -> Callable[[], None]:
     return _release
 
 
+def _call_block_with_swap(
+    block: nn.Module,
+    input_holder: list[torch.Tensor],
+    block_kwargs: dict[str, Any],
+) -> torch.Tensor:
+    """Run one DiT block with the residual host swap armed.
+
+    The block input is handed over through ``input_holder`` instead of a plain
+    argument: ``nn.Module.__call__`` keeps its own ``args`` tuple alive for the
+    whole ``forward`` (that is the fourth strong reference that used to defeat
+    the swap), so passing the tensor positionally pins its device storage even
+    after the block clears its locals. The block pops the holder at entry, which
+    leaves the caller with no alias and lets the storage be returned to the
+    allocator before attention starts.
+    """
+    return block(input_holder=input_holder, **block_kwargs)
+
+
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 
@@ -1084,7 +1102,7 @@ class MiniMaxH3DiTBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | None = None,
         *,
         t_emb: torch.Tensor,
         combined_indices: torch.Tensor,
@@ -1098,6 +1116,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         vsa_prefix_segments: tuple[int, ...] = (),
         vdn_window: VDNLayout | None = None,
         release_input: Callable[[], None] | None = None,
+        input_holder: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1105,7 +1124,22 @@ class MiniMaxH3DiTBlock(nn.Module):
         Each block computes AdaLN parameters once, then applies
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
+
+        ``input_holder`` is the D2 (host swap) entry point: the caller stores
+        the block input in a single-element list and passes that list, so no
+        caller-side alias survives the ``nn.Module.__call__`` argument tuple.
+        The block pops it here. ``release_input`` is the legacy pre-t86 hook and
+        is only consulted when ``input_holder`` is not used.
         """
+        if input_holder is not None:
+            if not input_holder:
+                raise ValueError("input_holder was empty; the block input was already consumed")
+            x = input_holder.pop()
+            if x is None:
+                raise ValueError("input_holder carried no tensor")
+            release_input = None
+        if x is None:
+            raise ValueError("MiniMaxH3DiTBlock.forward requires x or input_holder")
         (
             shift_msa,
             scale_msa,
@@ -1136,9 +1170,10 @@ class MiniMaxH3DiTBlock(nn.Module):
                     world_size=_probe_world_size(),
                 )
                 swap_handle = swap_pool.swap_out(residual, release=release_input)
-                # Drop the remaining strong references (the block parameter and
-                # the residual alias) so the device storage is genuinely
-                # returned to the allocator; the host slot keeps the bytes.
+                # Drop every remaining strong reference (the residual alias and
+                # the parameter) so the device storage is genuinely returned to
+                # the allocator. With input_holder the caller holds no alias,
+                # so this is the last reference.
                 residual = None
                 x = None
             with phase_probe.phase("block.attn", tensor=h):
@@ -1172,8 +1207,11 @@ class MiniMaxH3DiTBlock(nn.Module):
             with phase_probe.phase("block.mlp", tensor=h):
                 h = self.mlp(h)
         except BaseException:
+            # Drop our own references first, then never leave a D2H/H2D copy in
+            # flight on a failed request (cancellation included).
+            residual = None
+            x = None
             if swap_pool is not None:
-                # Never leave a D2H/H2D copy in flight on a failed request.
                 drain_residual_swap_pool()
             raise
         with phase_probe.phase("block.gate_mlp", tensor=residual):
@@ -1954,14 +1992,13 @@ class MiniMaxH3DiTModel(nn.Module):
             phase_probe.set_block(index)
             if swap_residuals:
                 # Hand the loop's own reference to the block so the swapped
-                # residual's device storage can actually be released.
-                holder = [hidden]
+                # residual's device storage can actually be released: the
+                # tensor travels inside a holder (popped by the block) because
+                # nn.Module.__call__ keeps its args tuple alive for the whole
+                # forward, which would otherwise pin the storage.
+                input_holder = [hidden]
                 hidden = None
-                hidden = block(
-                    holder[0],
-                    release_input=_make_input_release(holder),
-                    **block_kwargs,
-                )
+                hidden = _call_block_with_swap(block, input_holder, block_kwargs)
             else:
                 hidden = block(hidden, **block_kwargs)
         if local_len == seq_len:

@@ -18,6 +18,12 @@ Environment contract:
     size to obtain the per-rank budget: the design forbids a per-rank 48 GiB
     interpretation.
 
+Limitation (t86/O2): the per-rank budget is frozen when the pool is first
+created, using the world size known at that moment. Later calls with a
+different ``world_size`` reuse the existing pool and only log a warning; the
+pool is meant to be created on the first swap of the first request, after the
+distributed group is initialised.
+
 Correctness rules implemented here:
 
 * the device source storage stays valid until the D2H copy completes (the copy
@@ -136,10 +142,11 @@ class SwapHandle:
 class ResidualSwapPool:
     """Bounded pool of pinned host slots for one rank."""
 
-    def __init__(self, *, max_bytes: int, device: torch.device | str) -> None:
+    def __init__(self, *, max_bytes: int, device: torch.device | str, world_size: int = 1) -> None:
         if max_bytes <= 0:
             raise ValueError("residual swap pool requires a positive byte budget")
         self.max_bytes = int(max_bytes)
+        self.world_size = max(1, int(world_size))
         self.device = torch.device(device)
         self._free: list[torch.Tensor] = []
         self._live: list[SwapHandle] = []
@@ -249,12 +256,14 @@ class ResidualSwapPool:
     def stats(self) -> dict[str, int | bool]:
         return {
             "max_bytes": self.max_bytes,
+            "world_size": self.world_size,
             "resident_bytes": self._resident_bytes,
             "peak_bytes": self._peak_bytes,
             "free_slots": len(self._free),
             "live_swaps": len(self._live),
             "swaps_out": self._swaps_out,
             "swaps_in": self._swaps_in,
+            "outstanding_copies": len(self._outstanding),
             "pinned": self._pinned_supported,
             "fallbacks": self._fallbacks,
         }
@@ -268,16 +277,32 @@ def get_residual_swap_pool(
     device: torch.device | str | None = None,
     world_size: int = 1,
 ) -> ResidualSwapPool:
-    """Return the process-wide pool (created on first use)."""
+    """Return the process-wide pool (created on first use).
+
+    The per-rank budget is derived from ``world_size`` only on the first call;
+    see the module docstring limitation (t86/O2).
+    """
     global _POOL
     if _POOL is None:
         if device is None:
             device = "npu" if _npu_available() else "cpu"
-        _POOL = ResidualSwapPool(max_bytes=per_rank_budget_bytes(world_size), device=device)
+        _POOL = ResidualSwapPool(
+            max_bytes=per_rank_budget_bytes(world_size),
+            device=device,
+            world_size=world_size,
+        )
         logger.info(
-            "[H3_SWAP] residual host swap enabled: budget/rank=%.2f GiB pinned=%s",
+            "[H3_SWAP] residual host swap enabled: budget/rank=%.2f GiB world_size=%d pinned=%s",
             _POOL.max_bytes / (1024**3),
+            _POOL.world_size,
             _POOL.stats()["pinned"],
+        )
+    elif max(1, int(world_size)) != _POOL.world_size:
+        logger.warning(
+            "[H3_SWAP] residual swap pool already exists with world_size=%d; ignoring world_size=%d "
+            "(budget is frozen at pool creation)",
+            _POOL.world_size,
+            max(1, int(world_size)),
         )
     return _POOL
 
