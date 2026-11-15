@@ -10,7 +10,7 @@ layout.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -55,8 +55,16 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.models.minimax_h3.ffn_chunk import chunked_ffn_forward, ffn_chunk_count
+from vllm_omni.diffusion.models.minimax_h3.residual_swap import (
+    MODE_HOST,
+    drain_residual_swap_pool,
+    get_residual_swap_pool,
+    residual_swap_mode,
+)
 from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy, resolve_offload
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
+from vllm_omni.diffusion.utils import phase_probe
 from vllm_omni.platforms import current_omni_platform
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
@@ -149,6 +157,28 @@ class MiniMaxH3DiTArchConfig:
 
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
+
+
+def _probe_world_size() -> int:
+    """World size used to split the job-wide residual swap budget."""
+    distributed = getattr(torch, "distributed", None)
+    if distributed is not None and distributed.is_available() and distributed.is_initialized():
+        try:
+            return int(distributed.get_world_size())
+        except Exception:  # noqa: BLE001 - diagnostics/budget only
+            return 1
+    return 1
+
+
+def _make_input_release(holder: list) -> Callable[[], None]:
+    """Return a callback that drops the block loop's reference to its input."""
+
+    def _release() -> None:
+        holder[0] = None
+
+    return _release
+
+
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 
@@ -657,7 +687,8 @@ class MiniMaxH3Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch."""
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        with phase_probe.phase("qkv.proj", tensor=x):
+            qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -777,12 +808,28 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )
+        # Output width, so the chunked path can preallocate its result.
+        self.hidden_size = arch.hidden_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden, _ = self.fc1(x)
-        hidden = self.act_fn(hidden)
-        out, _ = self.fc2(hidden)
-        return out
+        chunks = ffn_chunk_count()
+        if chunks <= 1:
+            with phase_probe.phase("ffn.fc1", tensor=x):
+                hidden, _ = self.fc1(x)
+            with phase_probe.phase("ffn.act", tensor=hidden):
+                hidden = self.act_fn(hidden)
+            with phase_probe.phase("ffn.fc2", tensor=hidden):
+                out, _ = self.fc2(hidden)
+            return out
+        with phase_probe.phase("ffn.chunked", tensor=x, extra={"chunks": chunks}):
+            return chunked_ffn_forward(
+                x,
+                self.fc1,
+                self.act_fn,
+                self.fc2,
+                out_features=self.hidden_size,
+                chunks=chunks,
+            )
 
 
 class MiniMaxH3AdalnProj(nn.Module):
@@ -1050,6 +1097,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         vdn_window: VDNLayout | None = None,
+        release_input: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1068,39 +1116,68 @@ class MiniMaxH3DiTBlock(nn.Module):
         ) = self.adaln_proj(t_emb)
 
         residual = x
-        h = rms_norm_indexed_scale_shift(
-            x,
-            self.norm1.weight,
-            shift_msa,
-            scale_msa,
-            combined_indices,
-            self.norm1.variance_epsilon,
-        )
-        h = self.attn(
-            h,
-            rope_table=rope_table,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            packed_total=packed_total,
-            num_requests=num_requests,
-            sp_seq_lens=sp_seq_lens,
-            video_layout=video_layout,
-            vsa_prefix_segments=vsa_prefix_segments,
-            vdn_window=vdn_window,
-        )
-        x, h = indexed_gate_rms_norm_scale_shift(
-            residual,
-            gate_msa,
-            h,
-            self.norm2.weight,
-            shift_mlp,
-            scale_mlp,
-            combined_indices,
-            self.norm2.variance_epsilon,
-        )
-        residual = x
-        h = self.mlp(h)
-        return indexed_gate(residual, gate_mlp, h, combined_indices)
+        swap_handle = None
+        swap_pool = None
+        try:
+            with phase_probe.phase("block.norm1", tensor=x):
+                h = rms_norm_indexed_scale_shift(
+                    x,
+                    self.norm1.weight,
+                    shift_msa,
+                    scale_msa,
+                    combined_indices,
+                    self.norm1.variance_epsilon,
+                )
+            if residual_swap_mode() == MODE_HOST:
+                # Only the block input handed to the gated residual is swapped:
+                # it is the one tensor that must stay alive across attention.
+                swap_pool = get_residual_swap_pool(
+                    device=residual.device,
+                    world_size=_probe_world_size(),
+                )
+                swap_handle = swap_pool.swap_out(residual, release=release_input)
+                # Drop the remaining strong references (the block parameter and
+                # the residual alias) so the device storage is genuinely
+                # returned to the allocator; the host slot keeps the bytes.
+                residual = None
+                x = None
+            with phase_probe.phase("block.attn", tensor=h):
+                h = self.attn(
+                    h,
+                    rope_table=rope_table,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    packed_total=packed_total,
+                    num_requests=num_requests,
+                    sp_seq_lens=sp_seq_lens,
+                    video_layout=video_layout,
+                    vsa_prefix_segments=vsa_prefix_segments,
+                    vdn_window=vdn_window,
+                )
+            if swap_handle is not None:
+                residual = swap_pool.swap_in(swap_handle)
+                swap_handle = None
+            with phase_probe.phase("block.gate_attn", tensor=residual):
+                x, h = indexed_gate_rms_norm_scale_shift(
+                    residual,
+                    gate_msa,
+                    h,
+                    self.norm2.weight,
+                    shift_mlp,
+                    scale_mlp,
+                    combined_indices,
+                    self.norm2.variance_epsilon,
+                )
+            residual = x
+            with phase_probe.phase("block.mlp", tensor=h):
+                h = self.mlp(h)
+        except BaseException:
+            if swap_pool is not None:
+                # Never leave a D2H/H2D copy in flight on a failed request.
+                drain_residual_swap_pool()
+            raise
+        with phase_probe.phase("block.gate_mlp", tensor=residual):
+            return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -1860,20 +1937,33 @@ class MiniMaxH3DiTModel(nn.Module):
                 block_rope,
                 block_combined,
             )
-        for block in self.blocks:
-            hidden = block(
-                hidden,
-                t_emb=t_emb,
-                combined_indices=block_combined,
-                rope_table=block_rope,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                packed_total=seq_len,
-                num_requests=num_requests,
-                video_layout=video_layout,
-                vsa_prefix_segments=vsa_prefix_segments,
-                vdn_window=vdn_window,
-            )
+        block_kwargs = {
+            "t_emb": t_emb,
+            "combined_indices": block_combined,
+            "rope_table": block_rope,
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max_seqlen,
+            "packed_total": seq_len,
+            "num_requests": num_requests,
+            "video_layout": video_layout,
+            "vsa_prefix_segments": vsa_prefix_segments,
+            "vdn_window": vdn_window,
+        }
+        swap_residuals = residual_swap_mode() == MODE_HOST
+        for index, block in enumerate(self.blocks):
+            phase_probe.set_block(index)
+            if swap_residuals:
+                # Hand the loop's own reference to the block so the swapped
+                # residual's device storage can actually be released.
+                holder = [hidden]
+                hidden = None
+                hidden = block(
+                    holder[0],
+                    release_input=_make_input_release(holder),
+                    **block_kwargs,
+                )
+            else:
+                hidden = block(hidden, **block_kwargs)
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
             video_logits, audio_logits = self.final_layer(

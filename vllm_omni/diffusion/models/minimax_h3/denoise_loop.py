@@ -22,6 +22,7 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.diffusion.utils import phase_probe
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
@@ -382,6 +383,8 @@ def minimax_h3_denoise_loop(
     video_solver = create_h3_sample_solver(sampler, sigmas_video)
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
+    # D0 phase probe: one peak reset per request, then tag records by step.
+    phase_probe.reset_peaks()
     start_step = int(start_step)
     if start_step < 0 or start_step > num_steps:
         raise ValueError(f"start_step must be in [0, {num_steps}], got {start_step}")
@@ -412,6 +415,7 @@ def minimax_h3_denoise_loop(
         audio_solver.step_index = start_step
     for step in range(start_step, num_steps):
         check_request_cancellation()
+        phase_probe.set_step(step)
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v = sigmas_video[step]

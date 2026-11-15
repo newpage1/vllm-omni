@@ -42,6 +42,7 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.utils import phase_probe
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -589,7 +590,8 @@ class Attention(nn.Module):
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
-        query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+        with phase_probe.phase("attn.pre_attention", tensor=query):
+            query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
         # Scheduler rows describe the logical sequence, while strict Ulysses
         # may append synthetic tokens solely to make the image shard divisible.
@@ -637,9 +639,11 @@ class Attention(nn.Module):
         else:
             attn_metadata = self._with_kv_cache_dtype(attn_metadata)
             if self.use_ring and strategy is not self._no_parallel_strategy:
-                out = self._run_ring_attention(query, key, value, attn_metadata)
+                with phase_probe.phase("attn.ring_kernel", tensor=query):
+                    out = self._run_ring_attention(query, key, value, attn_metadata)
             else:
-                out = self._run_local_attention(query, key, value, attn_metadata)
+                with phase_probe.phase("attn.local_kernel", tensor=query):
+                    out = self._run_local_attention(query, key, value, attn_metadata)
 
         if paged_sp_padding:
             padding_start = paged_sp_padding_offset - paged_sp_padding
@@ -648,7 +652,8 @@ class Attention(nn.Module):
 
         # 3. Post-processing (Reverse Communication)
         # For Ulysses: AllToAll Output, and AllGather Joint Output
-        out = strategy.post_attention(out, ctx)
+        with phase_probe.phase("attn.post_attention", tensor=out):
+            out = strategy.post_attention(out, ctx)
         if getattr(self, "_explicit_cross_contract", False) and attn_metadata is not None:
             if attn_metadata.cross_query_mask is not None:
                 out = out.masked_fill(~attn_metadata.cross_query_mask[:, :, None, None], 0)
