@@ -32,6 +32,11 @@ from vllm_omni.diffusion.attention.capabilities import (
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
+from vllm_omni.diffusion.attention.q_chunk import (
+    plan_q_chunking,
+    q_chunk_count,
+    run_chunked_attention,
+)
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -642,8 +647,17 @@ class Attention(nn.Module):
                 with phase_probe.phase("attn.ring_kernel", tensor=query):
                     out = self._run_ring_attention(query, key, value, attn_metadata)
             else:
-                with phase_probe.phase("attn.local_kernel", tensor=query):
-                    out = self._run_local_attention(query, key, value, attn_metadata)
+                # H3_ATTN_Q_CHUNKS=1 (default) keeps this branch byte-identical
+                # to the untouched path: only the >1 case reaches the chunk
+                # driver, which validates the exactness contract itself.
+                q_chunks = q_chunk_count()
+                if q_chunks > 1:
+                    out = self._run_local_attention_q_chunked(
+                        query, key, value, attn_metadata, q_chunks
+                    )
+                else:
+                    with phase_probe.phase("attn.local_kernel", tensor=query):
+                        out = self._run_local_attention(query, key, value, attn_metadata)
 
         if paged_sp_padding:
             padding_start = paged_sp_padding_offset - paged_sp_padding
@@ -868,6 +882,46 @@ class Attention(nn.Module):
             return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
         return self.attention.forward(query, key, value, attn_metadata)
+
+    def _run_local_attention_q_chunked(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        chunks: int,
+    ) -> torch.Tensor:
+        """Run the local kernel in exact Q-row chunks (H3_ATTN_Q_CHUNKS > 1).
+
+        Only reached from the mask-free local branch. ``plan_q_chunking`` raises
+        ``NotImplementedError`` when the exactness contract does not hold, so a
+        configuration mismatch can never masquerade as a working chunked run.
+        """
+        backend = self.attn_backend
+        supports_mask_free = bool(
+            backend is not None and backend.supports_packed_mask_free()
+        )
+        plan = plan_q_chunking(
+            chunks=chunks,
+            attn_metadata=attn_metadata,
+            query=query,
+            key=key,
+            backend_name=backend.get_name() if backend is not None else None,
+            backend_supports_mask_free=supports_mask_free,
+        )
+        with phase_probe.phase(
+            "attn.local_kernel",
+            tensor=query,
+            extra=plan.describe(),
+        ):
+            return run_chunked_attention(
+                plan=plan,
+                query=query,
+                key=key,
+                value=value,
+                attn_metadata=attn_metadata,
+                kernel=self._run_local_attention,
+            )
 
     def _assert_metadata_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
         if attn_metadata is None:
