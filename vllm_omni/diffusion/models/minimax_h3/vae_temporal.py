@@ -19,6 +19,13 @@ at adapter construction:
   delivered video is bit-identical while the resident decode buffer shrinks
   4x.
 
+``H3_VAE_CHUNK_ENCODE`` (default ``off``) moves the whole-video uint8 staging
+buffer off the accelerator: ``decode_latent`` still returns the same uint8
+tensor, but the buffer it fills lives in host memory, so the device peak drops
+by the size of the delivered video (17.18 GiB at 4K/30s). The MP4 path does not
+need this switch at all -- ``decode_to_mp4`` already publishes one temporal clip
+at a time into a bounded encoder and never allocates the whole video.
+
 Set ``VLLM_OMNI_VAE_LEGACY_TEMPORAL=1`` to keep the checkpoint's methods.
 """
 
@@ -33,11 +40,51 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _LEGACY_TEMPORAL_ENV = "VLLM_OMNI_VAE_LEGACY_TEMPORAL"
+_CHUNK_ENCODE_ENV = "H3_VAE_CHUNK_ENCODE"
+
+# Values that turn the host-side staging buffer on. ``host`` is the explicit
+# spelling used in the runbooks; the boolean spellings keep it consistent with
+# the other H3 switches.
+_HOST_STAGING_VALUES = frozenset({"1", "host", "true", "yes", "on"})
 
 
 def _legacy_temporal_enabled() -> bool:
     value = os.environ.get(_LEGACY_TEMPORAL_ENV, "0")
     return value.strip().lower() not in ("", "0", "false", "off")
+
+
+def _chunk_encode_enabled() -> bool:
+    """Whether the whole-video uint8 buffer is staged in host memory."""
+    value = os.environ.get(_CHUNK_ENCODE_ENV, "0")
+    return value.strip().lower() in _HOST_STAGING_VALUES
+
+
+def _allocate_uint8_output(out_shape, device: torch.device) -> torch.Tensor:
+    """Allocate the delivered-video buffer, on the host when asked to.
+
+    The buffer is write-only staging: every element is written exactly once,
+    in order, by :func:`_decode_temporal_streaming_uint8`'s ``write_part``, and
+    the value is returned to a caller that immediately moves it to the host
+    anyway. Pinning keeps the per-part copies cheap; a platform that refuses to
+    pin still gets a pageable buffer rather than a failed request.
+    """
+    if not _chunk_encode_enabled():
+        return torch.empty(out_shape, dtype=torch.uint8, device=device)
+    try:
+        buffer = torch.empty(out_shape, dtype=torch.uint8, device="cpu", pin_memory=device.type != "cpu")
+    except Exception:  # noqa: BLE001 - pinning is an optimisation, not a contract
+        logger.warning(
+            "Pinned host staging buffer unavailable for %r; falling back to pageable memory",
+            tuple(out_shape),
+            exc_info=True,
+        )
+        buffer = torch.empty(out_shape, dtype=torch.uint8, device="cpu")
+    logger.info(
+        "MiniMax-H3 chunk encode: whole-video uint8 staging buffer on host (%.1f MiB), device is %s",
+        buffer.numel() * buffer.element_size() / (1024**2),
+        device,
+    )
+    return buffer
 
 
 def _encode_temporal_tail_pad(self, x):
@@ -148,7 +195,7 @@ def _decode_temporal_streaming_uint8(self, z, z_head, z_tail, num_chunks, pad_to
         if dec is None:
             out_shape = list(part.shape)
             out_shape[2] = output_frames
-            dec = torch.empty(out_shape, dtype=torch.uint8, device=part.device)
+            dec = _allocate_uint8_output(out_shape, part.device)
             transform_rev = self.processor.transform_rev
             mean = torch.as_tensor(transform_rev.mean, dtype=part.dtype, device=part.device).view(1, 3, 1, 1, 1)
             std = torch.as_tensor(transform_rev.std, dtype=part.dtype, device=part.device).view(1, 3, 1, 1, 1)
@@ -228,6 +275,12 @@ def _decode_temporal_streaming_uint8(self, z, z_head, z_tail, num_chunks, pad_to
 
     if dec is None:
         raise RuntimeError("decode_temporal streaming produced no output tensor")
+    logger.info(
+        "MiniMax-H3 temporal decode: frames=%d staged_on=%s chunk_encode=%s",
+        output_frames,
+        dec.device.type,
+        _chunk_encode_enabled(),
+    )
     if logical_frames != total_frames or dropped_frames != pad_frames or write_pos != output_frames:
         raise RuntimeError(
             "decode_temporal streaming frame plan mismatch: "
