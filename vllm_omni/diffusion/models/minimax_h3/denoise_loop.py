@@ -460,6 +460,11 @@ def minimax_h3_denoise_loop(
                 v_video, v_audio = model(**fk)
             mv_video_t = v_video.float()[update]
             mv_audio_t = v_audio.float()[audio_update]
+            # t120: the raw velocities and the forward kwargs are dead after the
+            # two gathers. Dropping them here keeps the previous step's output
+            # rows out of the next iteration's DiT forward (Euler carries no
+            # history; see notes/t120_release_groups.md).
+            del v_video, v_audio, fk
 
             if video_edit is None:
                 x0_video = minimax_h3_rf_v_to_x0(
@@ -473,9 +478,12 @@ def minimax_h3_denoise_loop(
                     mv_video_t,
                     t_v,
                 )
+            del mv_video_t, model_video_rows  # only fed the x0 computation
             new_target = video_solver.step(video_rows[update], x0_video, step)
+            del x0_video  # consumed by the solver
             video_rows = video_rows.clone()
             video_rows[update] = new_target
+            del new_target  # copied into video_rows above
             if cond_anchor is not None:
                 video_rows[~update] = cond_anchor  # per-step imgvid cond reset
 
@@ -491,9 +499,12 @@ def minimax_h3_denoise_loop(
                     mv_audio_t,
                     t_a,
                 )
+            del mv_audio_t, model_audio_rows  # only fed the x0 computation
             new_audio = audio_solver.step(audio_rows[audio_update], x0_audio, step)
+            del x0_audio  # consumed by the solver
             audio_rows = audio_rows.clone()
             audio_rows[audio_update] = new_audio if positive.locked_audio_rows is None else positive.locked_audio_rows
+            del new_audio  # copied into audio_rows above
             if audio_anchor is not None:
                 audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
             if on_step is not None:
