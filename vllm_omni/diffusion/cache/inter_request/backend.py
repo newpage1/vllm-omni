@@ -244,7 +244,7 @@ class InterRequestCacheBackend(CacheBackend):
             self.ir.max_skip_ratio,
             self.ir.record_steps,
             self.ir.max_entries,
-            self.ir.persistent_dir,
+            self.ir.persistent_root,
             self.ir.clip_model_path,
             self.ir.intra_backend_name or "none",
         )

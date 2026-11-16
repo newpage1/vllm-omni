@@ -125,9 +125,17 @@ class H3InterRequestCacheStore:
         self.evictions = 0
         self._dir: str | None = None
         if config.persistent_dir:
-            self._dir = os.path.join(os.path.abspath(os.path.expanduser(config.persistent_dir)), f"rank-{self.rank:02d}")
+            root = config.persistent_root
+            self._dir = os.path.join(str(root), f"rank-{self.rank:02d}")
             os.makedirs(self._dir, exist_ok=True)
             self.load_persistent()
+            logger.info(
+                "[inter-request] rank %d: persistent dir=%s run_id=%s reuse=%s",
+                self.rank,
+                self._dir,
+                config.run_identity,
+                bool(config.reuse_persistent),
+            )
 
     # ------------------------------------------------------------- persistence
     @property

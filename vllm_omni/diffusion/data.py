@@ -681,6 +681,8 @@ class DiffusionCacheConfig:
     inter_request_clip_max_skip_ratio: float = 0.5
     inter_request_intra_backend: str | None = None
     inter_request_resume_warmup_steps: int = 4
+    inter_request_cache_run_id: str | None = None
+    inter_request_cache_reuse: bool = False
 
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -895,6 +897,8 @@ class OmniDiffusionConfig:
     inter_request_clip_min_skip: int | None = None
     inter_request_clip_max_skip_ratio: float | None = None
     inter_request_intra_backend: str | None = None
+    inter_request_cache_run_id: str | None = None
+    inter_request_cache_reuse: bool | None = None
     video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
 
@@ -1535,6 +1539,8 @@ class OmniDiffusionConfig:
             "inter_request_clip_min_skip": self.inter_request_clip_min_skip,
             "inter_request_clip_max_skip_ratio": self.inter_request_clip_max_skip_ratio,
             "inter_request_intra_backend": self.inter_request_intra_backend,
+            "inter_request_cache_run_id": self.inter_request_cache_run_id,
+            "inter_request_cache_reuse": self.inter_request_cache_reuse,
         }
         applied = {
             name: value

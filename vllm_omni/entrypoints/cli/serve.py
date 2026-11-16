@@ -15,6 +15,7 @@ import json
 import math
 import os
 import signal
+import time
 from types import FrameType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -152,6 +153,12 @@ class OmniServeCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: TrackingNamespace) -> None:
+        # Scope the inter-request cache to this engine process.  The workers are
+        # spawned from here and inherit the value, so a restart never loads the
+        # rows recorded by an earlier run (those rows are allocator state, and a
+        # stale hit replays a different process's decode).
+        if not os.environ.get("VLLM_OMNI_RUN_ID"):
+            os.environ["VLLM_OMNI_RUN_ID"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-p{os.getpid()}"
         if not os.environ.get("VLLM_DISABLE_LOG_LOGO"):
             os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
             log_logo()
@@ -858,6 +865,26 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             dest="inter_request_persistent_cache_dir",
             help="Directory of the persistent inter-request DiT cache (per-rank subdirectories).",
+        )
+        omni_config_group.add_argument(
+            "--inter-request-cache-run-id",
+            dest="inter_request_cache_run_id",
+            type=str,
+            default=None,
+            help=(
+                "Run id that scopes <cache-dir>/run-<id>/rank-NN. Defaults to VLLM_OMNI_RUN_ID, "
+                "which `serve` sets once per process so a restart never hits older rows."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--inter-request-cache-reuse",
+            dest="inter_request_cache_reuse",
+            action="store_true",
+            default=None,
+            help=(
+                "Reuse the flat <cache-dir>/rank-NN layout across restarts. Only enable when the "
+                "previous run's recorded rows are known to match this engine configuration."
+            ),
         )
         omni_config_group.add_argument(
             "--inter-request-clip-model-path",

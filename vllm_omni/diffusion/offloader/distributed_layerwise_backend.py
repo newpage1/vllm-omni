@@ -712,7 +712,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             slot_contaminated = True
             if self._shared_slot_group is not None:
                 slot_contaminated = weights_overwritten or self._shared_slot_group[self.current_slot] != self._group_id
-            if slot_contaminated:
+            # A clean slot tag is not proof that this block still owns its
+            # weights: ``offload_layer`` leaves zero-sized placeholders behind,
+            # and a stage that never runs in between keeps the slot stamped with
+            # this group.  That happens whenever a request skips the DiT stage
+            # entirely (for example a cross-request EXACT cache hit), and a
+            # following stage would then read empty weights.  The block's own
+            # materialization is the authoritative check, and the non-first
+            # hooks below already rely on it.
+            if slot_contaminated or not self.is_materialized:
                 # Another group (or no group) wrote to our slot — re-fetch
                 self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
             # Always wait for data to be ready (handles both sync and async paths)

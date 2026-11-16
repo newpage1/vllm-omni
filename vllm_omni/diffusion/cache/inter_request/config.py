@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -30,7 +32,20 @@ _NESTED_ALIASES = {
     "min_skip": "min_skip_steps",
     "max_skip_ratio": "max_skip_ratio",
     "record_step_latents": "record_steps",
+    "cache_run_id": "run_id",
+    "run_id": "run_id",
+    "cache_reuse": "reuse_persistent",
+    "reuse": "reuse_persistent",
+    "reuse_persistent_dir": "reuse_persistent",
 }
+
+
+def _sanitize_token(value: object) -> str:
+    """Reduce a run id to a safe single path component."""
+    text = str(value).strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
+    return cleaned[:96] or "run"
+
 
 _MODES = ("exact", "exact_semantic")
 
@@ -104,6 +119,14 @@ class InterRequestCacheConfig:
     # Composite mode: optionally run an intra-request backend underneath.
     intra_backend: str | None = None
     intra_config: dict[str, Any] = field(default_factory=dict)
+    # Run-scoped persistence.  By default the on-disk cache lives under
+    # ``<persistent_dir>/run-<run_id>/rank-NN`` so a new engine process can
+    # never hit entries recorded by an older process: the recorded rows are
+    # allocator state, not plain data, and a stale hit replays another
+    # process's decode.  ``reuse_persistent`` keeps the legacy flat layout for
+    # the cases where cross-restart reuse is explicitly wanted.
+    run_id: str | None = None
+    reuse_persistent: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in _MODES:
@@ -120,6 +143,10 @@ class InterRequestCacheConfig:
             raise ValueError("inter_request max_skip_ratio must be within (0, 1]")
         if self.intra_backend is not None and str(self.intra_backend).lower() in ("", "none"):
             object.__setattr__(self, "intra_backend", None)
+        if self.run_id is not None and not str(self.run_id).strip():
+            object.__setattr__(self, "run_id", None)
+        if self.run_id is not None:
+            object.__setattr__(self, "run_id", _sanitize_token(self.run_id))
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -129,6 +156,33 @@ class InterRequestCacheConfig:
     @property
     def intra_backend_name(self) -> str | None:
         return None if self.intra_backend is None else str(self.intra_backend).lower()
+
+    @property
+    def run_identity(self) -> str:
+        """Identifier of the engine run that owns ``persistent_dir``.
+
+        ``run_id`` wins; otherwise ``VLLM_OMNI_RUN_ID`` (exported by
+        ``vllm-omni serve`` before the workers start) is used.  The per-process
+        fallback keeps the default safe when the backend is built outside the
+        CLI: each process then owns its own directory instead of silently
+        sharing rows recorded by another process.
+        """
+        if self.run_id:
+            return str(self.run_id)
+        env = os.environ.get("VLLM_OMNI_RUN_ID", "").strip()
+        if env:
+            return _sanitize_token(env)
+        return f"pid{os.getpid()}-{int(time.time() * 1000) % 100000000:08d}"
+
+    @property
+    def persistent_root(self) -> str | None:
+        """Directory that holds this run's ``rank-NN`` subdirectories."""
+        if not self.persistent_dir:
+            return None
+        base = os.path.abspath(os.path.expanduser(str(self.persistent_dir)))
+        if self.reuse_persistent:
+            return base
+        return os.path.join(base, f"run-{self.run_identity}")
 
     @property
     def clip_identity(self) -> str:
@@ -204,6 +258,8 @@ class InterRequestCacheConfig:
         flat("intra_backend", "intra_backend")
         flat("intra_config", "intra_config")
         flat("resume_warmup_steps", "resume_warmup_steps")
+        flat("cache_run_id", "run_id")
+        flat("cache_reuse", "reuse_persistent")
         max_memory_gb = resolved.pop("max_memory_gb", None)
         if max_memory_gb is None:
             max_memory_gb = _lookup(config, "inter_request_max_memory_gb", None)

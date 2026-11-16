@@ -846,6 +846,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     inter_request_clip_min_skip: int | None = None
     inter_request_clip_max_skip_ratio: float | None = None
     inter_request_intra_backend: str | None = None
+    inter_request_cache_run_id: str | None = None
+    inter_request_cache_reuse: bool | None = None
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
     enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
@@ -1119,6 +1121,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             "inter_request_clip_min_skip": self.inter_request_clip_min_skip,
             "inter_request_clip_max_skip_ratio": self.inter_request_clip_max_skip_ratio,
             "inter_request_intra_backend": self.inter_request_intra_backend,
+            "inter_request_cache_run_id": self.inter_request_cache_run_id,
+            "inter_request_cache_reuse": self.inter_request_cache_reuse,
         }
         applied = {
             name: value
