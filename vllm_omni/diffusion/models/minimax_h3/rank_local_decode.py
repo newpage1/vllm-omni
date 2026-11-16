@@ -42,6 +42,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 RANK_LOCAL_DECODE_ENV = "VLLM_OMNI_VAE_RANK_LOCAL_DECODE"
+STREAM_ASSEMBLY_ENV = "H3_VAE_STREAM_ASSEMBLY"
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -49,6 +50,20 @@ def rank_local_decode_requested() -> bool:
     """Whether ``VLLM_OMNI_VAE_RANK_LOCAL_DECODE`` asks for the prototype."""
 
     return os.environ.get(RANK_LOCAL_DECODE_ENV, "").strip().lower() in _TRUTHY
+
+
+def stream_assembly_requested() -> bool:
+    """Whether the tile assembly writes straight into the output buffer.
+
+    Bounded by ``H3_VAE_STREAM_ASSEMBLY=1`` (default off). The stock assembly
+    concatenates each tile row and then concatenates the rows, so one decoded
+    clip frame exists twice at the peak (the row list plus the returned frame).
+    Streaming assembly copies every blended/trimmed tile straight into a
+    preallocated output tensor, which drops that duplicate frame without
+    changing a single element.
+    """
+
+    return os.environ.get(STREAM_ASSEMBLY_ENV, "").strip().lower() in _TRUTHY
 
 
 def rank_local_decode_installed(vae) -> bool:
@@ -205,6 +220,71 @@ def _gather_tiles(
     return results  # type: ignore[return-value]
 
 
+def _assemble_streamed(
+    vae,
+    all_decoded: list[torch.Tensor],
+    *,
+    i_max: int,
+    j_max: int,
+    y_len: list[int],
+    x_len: list[int],
+    y_overlap: list[int],
+    x_overlap: list[int],
+) -> torch.Tensor:
+    """Assemble the tiles straight into one preallocated frame buffer.
+
+    The stock assembly builds ``result_rows`` (one concatenated tensor per tile
+    row) and then concatenates those rows, so a full decoded clip frame exists
+    twice at the peak: once as the row tensors and once as the returned frame.
+    Here each blended/trimmed tile is copied into its slice of a single ``out``
+    tensor. The ``blend`` calls run in the same order on the same operands, so
+    the returned frame is bit-identical; only the concatenation temporaries
+    disappear.
+
+    Trimming mirrors the stock loop exactly (``tile_len - overlap`` except the
+    last row/column), and the row offsets are the running sum of those trimmed
+    heights.
+    """
+
+    model = vae.model
+    first = next((tile for tile in all_decoded if tile is not None), None)
+    if first is None:
+        raise RuntimeError("streamed tile assembly received no tiles")
+
+    trimmed_w = [x_len[j] - (x_overlap[j] if j < j_max - 1 else 0) for j in range(j_max)]
+    trimmed_h = [y_len[i] - (y_overlap[i] if i < i_max - 1 else 0) for i in range(i_max)]
+    out = first.new_empty(
+        (first.shape[0], first.shape[1], first.shape[2], sum(trimmed_h), sum(trimmed_w))
+    )
+
+    y_offset = 0
+    previous_row: list[torch.Tensor] | None = None
+    for i in range(i_max):
+        row = all_decoded[i * j_max : (i + 1) * j_max]
+        if len(row) != j_max:
+            raise RuntimeError(
+                f"streamed tile assembly expected {j_max} tiles in row {i}, got {len(row)}"
+            )
+        x_offset = 0
+        for j, tile in enumerate(row):
+            if tile is None:
+                raise RuntimeError(f"streamed tile assembly missing tile ({i}, {j})")
+            if i > 0:
+                assert previous_row is not None
+                tile = model.blend(previous_row[j], tile, y_overlap[i - 1], dim=-2)
+            if j > 0:
+                tile = model.blend(row[j - 1], tile, x_overlap[j - 1], dim=-1)
+            height = trimmed_h[i]
+            width = trimmed_w[j]
+            out[..., y_offset : y_offset + height, x_offset : x_offset + width].copy_(
+                tile[..., :height, :width]
+            )
+            x_offset += width
+        previous_row = row
+        y_offset += trimmed_h[i]
+    return out
+
+
 def _rank_local_tiled_decode(vae, z: torch.Tensor) -> torch.Tensor:
     """Mirror of ``AutoencoderKL.tiled_decode`` with uint8 tile transport."""
 
@@ -244,36 +324,52 @@ def _rank_local_tiled_decode(vae, z: torch.Tensor) -> torch.Tensor:
     gather_peak = max(gather_peak, _device_mem_mib()[1])
     del local_tiles
 
-    rows: list[list[torch.Tensor | None]] = [[None] * j_max for _ in range(i_max)]
-    for index, tile in enumerate(all_decoded):
-        rows[index // j_max][index % j_max] = tile
+    rows: list[list[torch.Tensor | None]] | None = None
 
-    result_rows: list[torch.Tensor] = []
-    for i, row in enumerate(rows):
-        result_row: list[torch.Tensor] = []
-        for j, tile in enumerate(row):
-            assert tile is not None
-            if i > 0:
-                tile = vae.model.blend(rows[i - 1][j], tile, y_overlap[i - 1], dim=-2)  # type: ignore[arg-type]
-            if j > 0:
-                tile = vae.model.blend(row[j - 1], tile, x_overlap[j - 1], dim=-1)  # type: ignore[arg-type]
-            if i < len(rows) - 1:
-                tile = tile[..., : -y_overlap[i], :]
-            if j < len(row) - 1:
-                tile = tile[..., :, : -x_overlap[j]]
-            result_row.append(tile)
-        result_rows.append(torch.cat(result_row, dim=-1))
-    dec = torch.cat(result_rows, dim=-2)
+    assembly = "stream" if stream_assembly_requested() else "concat"
+    if assembly == "stream":
+        dec = _assemble_streamed(
+            vae,
+            all_decoded,
+            i_max=i_max,
+            j_max=j_max,
+            y_len=y_len,
+            x_len=x_len,
+            y_overlap=y_overlap,
+            x_overlap=x_overlap,
+        )
+    else:
+        rows = [[None] * j_max for _ in range(i_max)]
+        for index, tile in enumerate(all_decoded):
+            rows[index // j_max][index % j_max] = tile
+        result_rows: list[torch.Tensor] = []
+        for i, row in enumerate(rows):
+            result_row: list[torch.Tensor] = []
+            for j, tile in enumerate(row):
+                assert tile is not None
+                if i > 0:
+                    tile = vae.model.blend(rows[i - 1][j], tile, y_overlap[i - 1], dim=-2)  # type: ignore[arg-type]
+                if j > 0:
+                    tile = vae.model.blend(row[j - 1], tile, x_overlap[j - 1], dim=-1)  # type: ignore[arg-type]
+                if i < len(rows) - 1:
+                    tile = tile[..., : -y_overlap[i], :]
+                if j < len(row) - 1:
+                    tile = tile[..., :, : -x_overlap[j]]
+                result_row.append(tile)
+            result_rows.append(torch.cat(result_row, dim=-1))
+        dec = torch.cat(result_rows, dim=-2)
+        del rows, result_rows
 
     after_alloc, after_peak = _device_mem_mib()
     logger.info(
-        "[H3_VAE_RANK_LOCAL] tiles=%d local=%d/%d %s transport=%s bytes=%.2fMiB "
+        "[H3_VAE_RANK_LOCAL] tiles=%d local=%d/%d %s transport=%s assembly=%s bytes=%.2fMiB "
         "alloc_mib=%.1f->%.1f peak_gain_mib=%.1f tile_peak_mib=%.1f gather_peak_mib=%.1f",
         num_tiles,
         len(local_indices),
         sp_size,
         "gather=reuse" if getattr(vae, "_rank_local_gather_reused", False) else "gather=alloc",
         getattr(vae, "_rank_local_gather_mode", "local"),
+        assembly,
         float(dec.numel()) / (1024.0 * 1024.0),
         before_alloc,
         after_alloc,
