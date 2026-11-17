@@ -146,6 +146,7 @@ from .minimax_h3_transformer import (
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
     _attention_isolates_packed_requests,
+    batched_request_mode_enabled,
 )
 from .npu.lora import (
     MINIMAX_H3_NATIVE_INFERENCE_STEPS,
@@ -644,6 +645,10 @@ class MiniMaxH3Pipeline(
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
     supports_step_execution: ClassVar[bool] = True
+    # Prototype: pack several requests into one packed DiT forward. Off unless
+    # ``H3_BATCHED_REQUEST_MODE`` was set when this module was imported, because
+    # the engine reads this class attribute once at construction time.
+    supports_request_batch: ClassVar[bool] = batched_request_mode_enabled()
     # DiT implementation constructed for the primary ``transformer``.
     # ``None`` means this module's ``MiniMaxH3DiTModel`` (resolved at call time);
     # a derived pipeline may point this at a subclass.
@@ -3522,9 +3527,11 @@ class MiniMaxH3Pipeline(
         }
 
     @torch.no_grad()
-    def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
+    def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput | list[DiffusionOutput]:
         if len(request.prompts) != 1:
-            raise OmniClientError("MiniMax H3 supports one request at a time")
+            if not batched_request_mode_enabled():
+                raise OmniClientError("MiniMax H3 supports one request at a time")
+            return self._forward_batched_requests(request)
         check_request_cancellation()
         context = self._prepare_request_inputs(
             request.prompts[0],
@@ -3616,6 +3623,117 @@ class MiniMaxH3Pipeline(
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )
 
+
+    def _forward_batched_requests(self, request: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Run one packed DiT forward per denoise step for every request.
+
+        Prototype path behind ``H3_BATCHED_REQUEST_MODE``. It reuses the step
+        primitives (``prepare_encode`` / ``denoise_step`` / ``step_scheduler`` /
+        ``post_decode``) so batching needs no second denoise loop, and it returns
+        one ``DiffusionOutput`` per request -- the shape the runner requires from
+        a request-batch forward.
+
+        Requests must agree on the latent geometry, the task-specific DiT and the
+        number of denoise steps. Conditioning inputs, edits and latent refine are
+        rejected by ``prepare_encode`` / the homogeneity check rather than being
+        silently packed into one document grid.
+        """
+        prompts = list(request.prompts)
+        samplings = list(request.sampling_params_list)
+        if len(prompts) != len(samplings):
+            raise OmniClientError(
+                "MiniMax H3 batch forward needs one sampling params per prompt, got "
+                f"{len(prompts)} prompt(s) and {len(samplings)} sampling params"
+            )
+        # ``StepRequestState`` is a runner type and the pipeline only imports it
+        # for annotations (TYPE_CHECKING), so pull it in here to avoid a module
+        # import cycle with the worker package.
+        from vllm_omni.diffusion.worker.utils import StepRequestState as _StepRequestState
+
+        states: list[StepRequestState] = []
+        for index, (prompt, sampling) in enumerate(zip(prompts, samplings)):
+            check_request_cancellation()
+            state = _StepRequestState(request_id=f"batch-{index}", prompt=prompt, sampling=sampling)
+            states.append(self.prepare_encode(state))
+        self._validate_batched_states(states)
+        total_steps = len(states[0].extra[_STEP_SIGMAS_VIDEO]) - 1
+        rows_per_request = [int(state.latents.shape[0]) for state in states]
+        transformer = states[0].extra[_STEP_TRANSFORMER]
+        logger.info(
+            "[h3-batch] packed %d request(s) into one forward per step: rows=%s steps=%d steps_per_forward=%d",
+            len(states),
+            rows_per_request,
+            total_steps,
+            total_steps,
+        )
+        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
+            for step in range(total_steps):
+                check_request_cancellation()
+                video_velocity = self.denoise_step(self._batched_input_batch(states), states=states)
+                predictions = torch.split(video_velocity, rows_per_request)
+                for state, prediction in zip(states, predictions):
+                    self.step_scheduler(state, prediction)
+                logger.debug("[h3-batch] step %d/%d done", step + 1, total_steps)
+        return [self.post_decode(state) for state in states]
+
+    @staticmethod
+    def _validate_batched_states(states: list[StepRequestState]) -> None:
+        """Reject a batch the packed path cannot represent faithfully."""
+        if len(states) < 2:
+            raise OmniClientError("MiniMax H3 batch forward needs at least two requests")
+        reference = states[0]
+        reference_shape = reference.extra[_STEP_SHAPE]
+        reference_steps = len(reference.extra[_STEP_SIGMAS_VIDEO])
+        for state in states:
+            shape = state.extra[_STEP_SHAPE]
+            geometry = tuple(shape[key] for key in ("latent_t", "latent_h", "latent_w", "audio_t"))
+            expected = tuple(reference_shape[key] for key in ("latent_t", "latent_h", "latent_w", "audio_t"))
+            if geometry != expected:
+                raise OmniClientError(
+                    f"MiniMax H3 batch forward needs identical latent geometry, got {geometry} and {expected}; "
+                    "run the requests one at a time instead"
+                )
+            if state.extra[_STEP_TRANSFORMER] is not reference.extra[_STEP_TRANSFORMER]:
+                raise OmniClientError("MiniMax H3 batch forward needs every request on the same task-specific DiT")
+            if len(state.extra[_STEP_SIGMAS_VIDEO]) != reference_steps:
+                raise OmniClientError(
+                    "MiniMax H3 batch forward needs the same number of denoise steps for every request"
+                )
+            if state.extra.get(_STEP_VIDEO_EDIT) is not None or state.extra.get(_STEP_AUDIO_EDIT) is not None:
+                raise OmniClientError("MiniMax H3 batch forward does not support video/audio edit rows")
+
+    @staticmethod
+    def _batched_input_batch(states: list[StepRequestState]) -> InputBatch:
+        """Build the ``InputBatch`` view the runner usually supplies in step mode.
+
+        ``denoise_step`` reads the per-request rows out of ``states``; this batch
+        only keeps the step bookkeeping the shared contract expects (request ids,
+        the current timestep per request and the packed latent rows).
+        """
+        from vllm_omni.diffusion.worker.input_batch import InputBatch as _InputBatch
+
+        device = states[0].latents.device
+        index = torch.arange(len(states), dtype=torch.int64, device=device)
+        timesteps = torch.tensor(
+            [float(state.timesteps[min(state.step_index, len(state.timesteps) - 1)]) for state in states],
+            dtype=torch.float32,
+            device=device,
+        )
+        return _InputBatch(
+            request_ids=[state.request_id for state in states],
+            num_reqs=len(states),
+            num_reqs_after_padding=len(states),
+            idx_mapping=index,
+            idx_mapping_np=np.arange(len(states)),
+            latents=torch.cat([state.latents for state in states]),
+            timesteps=timesteps,
+            prompt_embeds=None,
+            prompt_embeds_mask=None,
+            negative_prompt_embeds=None,
+            negative_prompt_embeds_mask=None,
+            states=states,
+        )
+
     def _decoder_stage_output(
         self,
         video_latents: list[torch.Tensor],
@@ -3679,7 +3797,11 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"MiniMax H3 step execution produces one output per request, got num_outputs_per_prompt={num_outputs}"
             )
-        if getattr(self, "_dlo_residency_controller", None) is not None:
+        # The prototype request-batch path holds one resident window around the
+        # whole batched denoise loop (see ``_forward_batched_requests``), so DLO
+        # streaming does not re-materialize the DiT per step and the step-mode
+        # rejection below does not apply to it.
+        if getattr(self, "_dlo_residency_controller", None) is not None and not batched_request_mode_enabled():
             raise ValueError(
                 "MiniMax H3 step execution is not compatible with distributed layerwise offload; "
                 "the resident-layer window spans a whole denoise loop, so per-step streaming would "

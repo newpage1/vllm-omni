@@ -10,6 +10,7 @@ layout.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -100,6 +101,22 @@ def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
     if backend is None or not backend.supports_multi_doc_packed_varlen():
         return False
     return not _ring_sequence_parallel_is_active(attention_layer)
+
+
+_BATCHED_REQUEST_MODE_ENV = "H3_BATCHED_REQUEST_MODE"
+
+
+def batched_request_mode_enabled() -> bool:
+    """Prototype switch: run several requests through one packed DiT forward.
+
+    Off by default.  Even when enabled, packing stays limited to layouts whose
+    documents can stay isolated: a backend that advertises
+    ``supports_multi_doc_packed_varlen`` runs its native varlen kernel, and every
+    other backend -- including the NPU flash path, which only accepts a
+    ``[real, pad]`` two-document plan -- is served by the segment-wise SDPA
+    island in :func:`_sdpa_varlen_attention` instead of being rejected.
+    """
+    return os.environ.get(_BATCHED_REQUEST_MODE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -575,7 +592,17 @@ class MiniMaxH3Attention(nn.Module):
             # name): FLASH_ATTN's NPU/XPU variants would otherwise silently
             # fall back to a padding-mask rebuild that spans the whole packed
             # row and attend across request boundaries.
-            if not _attention_isolates_packed_requests(self.attention):
+            if _attention_isolates_packed_requests(self.attention):
+                used = packed_total
+            elif batched_request_mode_enabled() and not use_ring:
+                # Prototype batch path (H3_BATCHED_REQUEST_MODE): this backend
+                # cannot plan N documents from cu_seqlens, so attend each
+                # document inside the segment-wise SDPA island instead of
+                # rejecting the batch. Ring is excluded because its kernel
+                # reshards rows across the whole packed sequence.
+                out = _sdpa_varlen_attention(q, k, v, cu_seqlens, self.softmax_scale)
+                return out.reshape(out.shape[0], self.num_heads * self.head_dim)
+            else:
                 backend_name = self.attention.attn_backend.get_name()
                 raise ValueError(
                     f"MiniMax H3 packed a {num_requests}-request batch, but the resolved "
@@ -583,7 +610,6 @@ class MiniMaxH3Attention(nn.Module):
                     "does not isolate multi-document packed cu_seqlens. Run one request "
                     "per forward on this backend."
                 )
-            used = packed_total
         else:
             used = min(max_seqlen, packed_total)
             # Ring attention can dispatch to a different implementation from the
